@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2013-2016 Google Inc. All rights reserved
+ * Copyright (c) 2015-2018, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -24,8 +25,10 @@
 #define __LIB_SM_SMCALL_H
 
 #define SMC_NUM_ENTITIES	64
-#define SMC_NUM_ARGS		4
+#define SMC_NUM_ARGS		8
 #define SMC_NUM_PARAMS		(SMC_NUM_ARGS - 1)
+#define SMC_ARGS_GUESTID	6
+#define SMC_ARGS_WIDTH		32
 
 #define SMC_IS_FASTCALL(smc_nr)	((smc_nr) & 0x80000000)
 #define SMC_IS_SMC64(smc_nr)	((smc_nr) & 0x40000000)
@@ -52,6 +55,7 @@
 #define	SMC_ENTITY_TRUSTED_APP		48	/* Trusted Application calls */
 #define	SMC_ENTITY_TRUSTED_OS		50	/* Trusted OS calls */
 #define	SMC_ENTITY_LOGGING		51	/* Used for secure -> nonsecure logging */
+#define	SMC_ENTITY_GUEST_RESET		52	/* Reserved for Hypervisor Guest reset Trusted */
 #define	SMC_ENTITY_SECURE_MONITOR	60	/* Trusted OS calls internal to secure monitor */
 
 /* FC = Fast call, SC = Standard call */
@@ -123,6 +127,8 @@
 #define TRUSTY_API_VERSION_SMP_NOP	(3)
 #define TRUSTY_API_VERSION_CURRENT	(3)
 #define SMC_FC_API_VERSION	SMC_FASTCALL_NR (SMC_ENTITY_SECURE_MONITOR, 11)
+#define SMC_FC_HV_SHARE_GUEST_INFO SMC_FASTCALL_NR (SMC_ENTITY_SECURE_MONITOR, 12)
+#define SMC_FC_REGISTER_NS_DRAM_RANGES	SMC_FASTCALL_NR (SMC_ENTITY_SECURE_MONITOR, 13)
 
 /* TRUSTED_OS entity calls */
 #define SMC_SC_VIRTIO_GET_DESCR	SMC_STDCALL_NR(SMC_ENTITY_TRUSTED_OS, 20)
@@ -131,7 +137,11 @@
 
 #define SMC_SC_VDEV_RESET	SMC_STDCALL_NR(SMC_ENTITY_TRUSTED_OS, 23)
 #define SMC_SC_VDEV_KICK_VQ	SMC_STDCALL_NR(SMC_ENTITY_TRUSTED_OS, 24)
+#define SMC_SC_BL_LOCK_TOS_DATA SMC_STDCALL_NR(SMC_ENTITY_TRUSTED_OS, 65533)
+#define SMC_SC_BL_SEND_TOS_DATA SMC_STDCALL_NR(SMC_ENTITY_TRUSTED_OS, 65534)
+#define SMC_SC_SET_ROOT_OF_TRUST SMC_STDCALL_NR(SMC_ENTITY_TRUSTED_OS, 65535)
 #define SMC_NC_VDEV_KICK_VQ	SMC_STDCALL_NR(SMC_ENTITY_TRUSTED_OS, 25)
+#define SMC_NC_SIM_HANDLE_IRQ	SMC_STDCALL_NR(SMC_ENTITY_TRUSTED_OS, 26)
 
 /* Simplified (Queueless) IPC interface */
 #define SMC_SC_CREATE_QL_TIPC_DEV		SMC_STDCALL_NR(SMC_ENTITY_TRUSTED_OS, 30)

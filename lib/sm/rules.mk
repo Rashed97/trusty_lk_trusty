@@ -34,6 +34,9 @@ MODULE_SRCS += \
 	$(LOCAL_DIR)/smcall.c \
 	$(LOCAL_DIR)/ns_mem.c \
 
+MODULE_DEPS += \
+	lib/boot_profiler
+
 include $(LOCAL_DIR)/arch/$(ARCH)/rules.mk
 
 include make/module.mk

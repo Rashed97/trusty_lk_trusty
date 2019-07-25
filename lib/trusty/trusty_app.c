@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2013, NVIDIA CORPORATION. All rights reserved
+ * Copyright (c) 2012-2016, NVIDIA CORPORATION. All rights reserved
  * Copyright (c) 2013, Google, Inc. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
@@ -26,6 +26,7 @@
 
 #include <arch.h>
 #include <assert.h>
+#include <boot_profiler.h>
 #include <compiler.h>
 #include <debug.h>
 #include "elf.h"
@@ -34,6 +35,7 @@
 #include <kernel/thread.h>
 #include <malloc.h>
 #include <platform.h>
+#include <platform/platform_p.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,6 +70,15 @@ typedef struct trusty_app_manifest {
 #define TRUSTY_APP_STACK_TOP	0x1000000 /* 16MB */
 
 #define PAGE_MASK		(PAGE_SIZE - 1)
+#define NV_GUEST_TASK_MAGIC_STR	"NVGUESTTASK" /* TOS TASK Magic ID */
+#define NV_GUEST_TASK_MAGIC_ID_LEN	(11+1)   /* TOS TASK MAGIC ID LEN */
+#define NV_GUEST_TASK_HEAD_SIZE	0x20
+/*
+ * Define global variable for the number of guest-OS.
+ * It is used to determine whether it is in hypervisor mode.
+ * It will be updated when a VMID header found from TAs.
+ */
+uint32_t guest_count = 0;
 
 static u_int trusty_app_count;
 static trusty_app_t *trusty_app_list;
@@ -84,9 +95,9 @@ static mutex_t apps_lock = MUTEX_INITIAL_VALUE(apps_lock);
 static struct list_node app_notifier_list = LIST_INITIAL_VALUE(app_notifier_list);
 uint als_slot_cnt;
 
-#define PRINT_TRUSTY_APP_UUID(tid,u)					\
+#define PRINT_TRUSTY_APP_UUID(tid,u,v)					\
 	dprintf(SPEW,							\
-		"trusty_app %d uuid: 0x%x 0x%x 0x%x 0x%x%x 0x%x%x%x%x%x%x\n",\
+		"trusty_app %d uuid: 0x%x 0x%x 0x%x 0x%x%x 0x%x%x%x%x%x%x vmid 0x%x\n",\
 		tid,							\
 		(u)->time_low, (u)->time_mid,				\
 		(u)->time_hi_and_version,				\
@@ -97,7 +108,8 @@ uint als_slot_cnt;
 		(u)->clock_seq_and_node[4],				\
 		(u)->clock_seq_and_node[5],				\
 		(u)->clock_seq_and_node[6],				\
-		(u)->clock_seq_and_node[7]);
+		(u)->clock_seq_and_node[7],				\
+		v);
 
 static void finalize_registration(void)
 {
@@ -111,10 +123,11 @@ status_t trusty_register_app_notifier(trusty_app_notifier_t *n)
 	status_t ret = NO_ERROR;
 
 	mutex_acquire(&apps_lock);
-	if (!apps_started)
+	if (!apps_started) {
 		list_add_tail(&app_notifier_list, &n->node);
-	else
+	} else {
 		ret = ERR_ALREADY_STARTED;
+	}
 	mutex_release(&apps_lock);
 	return ret;
 }
@@ -124,17 +137,18 @@ int trusty_als_alloc_slot(void)
 	int ret;
 
 	mutex_acquire(&apps_lock);
-	if (!apps_started)
+	if (!apps_started) {
 		ret = ++als_slot_cnt;
-	else
+	} else {
 		ret = ERR_ALREADY_STARTED;
+	}
 	mutex_release(&apps_lock);
 	return ret;
 }
 
 
 static void load_app_config_options(intptr_t trusty_app_image_addr,
-		trusty_app_t *trusty_app, Elf32_Shdr *shdr)
+		trusty_app_t *trusty_app, Elf32_Shdr *shdr, u_int task_vmid)
 {
 	char  *manifest_data;
 	u_int *config_blob, config_blob_size;
@@ -149,6 +163,7 @@ static void load_app_config_options(intptr_t trusty_app_image_addr,
 	trusty_app->props.min_stack_size = DEFAULT_STACK_SIZE;
 
 	trusty_app_idx = trusty_app - trusty_app_list;
+	trusty_app->props.vmid = task_vmid;
 
 	manifest_data = (char *)(trusty_app_image_addr + shdr->sh_offset);
 
@@ -156,7 +171,7 @@ static void load_app_config_options(intptr_t trusty_app_image_addr,
 	       (uuid_t *)manifest_data,
 	       sizeof(uuid_t));
 
-	PRINT_TRUSTY_APP_UUID(trusty_app_idx, &trusty_app->props.uuid);
+	PRINT_TRUSTY_APP_UUID(trusty_app_idx, &trusty_app->props.uuid, trusty_app->props.vmid);
 
 	manifest_data += sizeof(trusty_app->props.uuid);
 
@@ -231,12 +246,14 @@ static status_t init_brk(trusty_app_t *trusty_app)
 
 	/* do we need to increase user mode heap (if not enough remains)? */
 	if ((trusty_app->end_brk - trusty_app->start_brk) >=
-	    trusty_app->props.min_heap_size)
+	    trusty_app->props.min_heap_size) {
 		return NO_ERROR;
+	}
 
 	heap = memalign(PAGE_SIZE, trusty_app->props.min_heap_size);
-	if (heap == 0)
+	if (heap == 0) {
 		return ERR_NO_MEMORY;
+	}
 	memset(heap, 0, trusty_app->props.min_heap_size);
 
 	vaddr = trusty_app->end_brk;
@@ -286,14 +303,14 @@ static status_t alloc_address_map(trusty_app_t *trusty_app)
 			prg_hdr->p_flags);
 #endif
 
-		if (prg_hdr->p_type != PT_LOAD)
+		if (prg_hdr->p_type != PT_LOAD) {
 			continue;
-
+		}
 		/* skip PT_LOAD if it's below trusty_app start or above .bss */
 		if ((prg_hdr->p_vaddr < TRUSTY_APP_START_ADDR) ||
-		    (prg_hdr->p_vaddr >= trusty_app->end_bss))
+		    (prg_hdr->p_vaddr >= trusty_app->end_bss)) {
 			continue;
-
+		}
 		/*
 		 * We're expecting to be able to execute the trusty_app in-place,
 		 * meaning its PT_LOAD segments, should be page-aligned.
@@ -334,18 +351,20 @@ static status_t alloc_address_map(trusty_app_t *trusty_app)
 
 		/* start of code/data */
 		first = prg_hdr->p_vaddr;
-		if (first < start_code)
+		if (first < start_code) {
 			start_code = first;
-		if (start_data < first)
+		}
+		if (start_data < first) {
 			start_data = first;
-
+		}
 		/* end of code/data */
 		last = prg_hdr->p_vaddr + prg_hdr->p_filesz;
-		if ((prg_hdr->p_flags & PF_X) && end_code < last)
+		if ((prg_hdr->p_flags & PF_X) && end_code < last) {
 			end_code = last;
-		if (end_data < last)
+		}
+		if (end_data < last) {
 			end_data = last;
-
+		}
 		/* end of brk */
 		last_mem = prg_hdr->p_vaddr + prg_hdr->p_memsz;
 		if (last_mem > trusty_app->start_brk) {
@@ -432,6 +451,44 @@ static char *align_next_app(Elf32_Ehdr *elf_hdr, Elf32_Shdr *pad_hdr,
 }
 
 /*
+ * Look up VMID in the Trusty task header that
+ * added during bind operation.
+ */
+static status_t update_task_addr_with_vmid(char **task_image_addr, u_int *task_vmid)
+{
+	char *task_header, *new_task_image_addr;
+	char *endp;
+
+	if (!strcmp(*task_image_addr, NV_GUEST_TASK_MAGIC_STR)) {
+		guest_count++;
+		if (guest_count == 1) {
+			/*
+			 * Disable write directly to UART port when we have 1
+			 * or more guest, preventing log conflict. Will remove
+			 * this if AON UART is ready. only do it once in
+			 * hypervisor mode.
+			 */
+			platform_disable_debug_intf();
+		}
+		task_header = *task_image_addr + NV_GUEST_TASK_MAGIC_ID_LEN;
+		/* Read TASK VMID, convert ASCII string to uint. */
+		*task_vmid = strtoul(task_header, &endp, 0);
+		if (*endp) {
+			dprintf(CRITICAL, "VMID convert fail\n");
+			return ERR_INVALID_ARGS;
+		}
+		new_task_image_addr = *task_image_addr + NV_GUEST_TASK_HEAD_SIZE;
+		trusty_app_image_size -= NV_GUEST_TASK_HEAD_SIZE;
+		trusty_app_image_end -= NV_GUEST_TASK_HEAD_SIZE;
+		memmove(*task_image_addr, new_task_image_addr, trusty_app_image_size);
+	} else {
+		dprintf(SPEW, "VMID not found\n");
+	}
+
+	return NO_ERROR;
+}
+
+/*
  * Look in the kernel's ELF header for trusty_app sections and
  * carveout memory for their LOAD-able sections.
  */
@@ -442,6 +499,7 @@ static void trusty_app_bootloader(void)
 	Elf32_Shdr *bss_shdr, *bss_pad_shdr, *manifest_shdr;
 	char *shstbl, *trusty_app_image_addr;
 	trusty_app_t *trusty_app = 0;
+	u_int task_vmid = 0;
 
 	dprintf(SPEW, "trusty_app: start %p size 0x%08x end %p\n",
 		trusty_app_image_start, trusty_app_image_size, trusty_app_image_end);
@@ -457,7 +515,11 @@ static void trusty_app_bootloader(void)
 
 	while (trusty_app_image_size > 0) {
 		u_int i, trusty_app_max_extent;
-
+		int ret;
+		ret = update_task_addr_with_vmid(&trusty_app_image_addr, &task_vmid);
+		if (ret != NO_ERROR) {
+			panic("failed to get trusty app image address \n");
+		}
 		ehdr = (Elf32_Ehdr *) trusty_app_image_addr;
 		if (strncmp((char *)ehdr->e_ident, ELFMAG, SELFMAG)) {
 			dprintf(CRITICAL, "trusty_app_bootloader: ELF header not found\n");
@@ -474,8 +536,9 @@ static void trusty_app_bootloader(void)
 		for (i = 0; i < ehdr->e_shnum; i++) {
 			u_int extent;
 
-			if (shdr[i].sh_type == SHT_NULL)
+			if (shdr[i].sh_type == SHT_NULL) {
 				continue;
+			}
 #if DEBUG_LOAD_TRUSTY_APP
 			dprintf(SPEW, "trusty_app: sect %d, off 0x%08x, size 0x%08x, flags 0x%02x, name %s\n",
 				i, shdr[i].sh_offset, shdr[i].sh_size, shdr[i].sh_flags, shstbl + shdr[i].sh_name);
@@ -496,8 +559,9 @@ static void trusty_app_bootloader(void)
 
 			if (shdr[i].sh_type != SHT_NOBITS) {
 				extent = shdr[i].sh_offset + shdr[i].sh_size;
-				if (trusty_app_max_extent < extent)
+				if (trusty_app_max_extent < extent) {
 					trusty_app_max_extent = extent;
+				}
 			}
 		}
 
@@ -508,7 +572,7 @@ static void trusty_app_bootloader(void)
 		ASSERT((bss_shdr->sh_offset + bss_shdr->sh_size) <= trusty_app_max_extent);
 		memset((uint8_t *)trusty_app_image_addr + bss_shdr->sh_offset, 0, bss_shdr->sh_size);
 
-		load_app_config_options((intptr_t)trusty_app_image_addr, trusty_app, manifest_shdr);
+		load_app_config_options((intptr_t)trusty_app_image_addr, trusty_app, manifest_shdr, task_vmid);
 		trusty_app->app_img = ehdr;
 
 		/* align next trusty_app start */
@@ -518,6 +582,9 @@ static void trusty_app_bootloader(void)
 		trusty_app_count++;
 		trusty_app++;
 	}
+
+	/* platform handler before exiting the bootloader  */
+	platform_app_bootloader_epilog();
 }
 
 status_t trusty_app_setup_mmio(trusty_app_t *trusty_app, u_int mmio_id,
@@ -534,13 +601,14 @@ status_t trusty_app_setup_mmio(trusty_app_t *trusty_app, u_int mmio_id,
 			size = ROUNDUP(trusty_app->props.config_blob[++i],
 					PAGE_SIZE);
 
-			if (id != mmio_id)
+			if (id != mmio_id) {
 				continue;
+			}
 
 			map_size = ROUNDUP(map_size, PAGE_SIZE);
-			if (map_size > size)
+			if (map_size > size) {
 				return ERR_INVALID_ARGS;
-
+			}
 			return uthread_map_contig(trusty_app->ut, vaddr, offset,
 						map_size, UTM_W | UTM_R | UTM_IO,
 						UT_MAP_ALIGN_4KB);
@@ -570,6 +638,7 @@ void trusty_app_init(void)
 
 	for (i = 0, trusty_app = trusty_app_list; i < trusty_app_count; i++, trusty_app++) {
 		char name[32];
+		char profiler_print[64];
 		uthread_t *uthread;
 		int ret;
 
@@ -589,6 +658,7 @@ void trusty_app_init(void)
 			/* TODO: do better than this */
 			panic("allocate user thread failed\n");
 		}
+		tegra_boot_profiler_record("app_init: uthread allocated");
 		trusty_app->ut = uthread;
 
 		ret = alloc_address_map(trusty_app);
@@ -607,22 +677,26 @@ void trusty_app_init(void)
 		list_for_every_entry(&app_notifier_list, n, trusty_app_notifier_t, node) {
 			if (n->startup) {
 				ret = n->startup(trusty_app);
-				if (ret != NO_ERROR)
+				if (ret != NO_ERROR) {
 					panic("failed (%d) to invoke startup notifier\n", ret);
+				}
 			}
 		}
+		snprintf(profiler_print, sizeof(profiler_print), "Loaded app: %s", name);
+		tegra_boot_profiler_record(profiler_print);
 	}
 }
 
-trusty_app_t *trusty_app_find_by_uuid(uuid_t *uuid)
+trusty_app_t *trusty_app_find_by_uuid(uuid_t *uuid, uint32_t vmid)
 {
 	trusty_app_t *ta;
 	u_int i;
 
 	/* find app for this uuid */
 	for (i = 0, ta = trusty_app_list; i < trusty_app_count; i++, ta++)
-		if (!memcmp(&ta->props.uuid, uuid, sizeof(uuid_t)))
+		if (!memcmp(&ta->props.uuid, uuid, sizeof(uuid_t)) && (ta->props.vmid == vmid)) {
 			return ta;
+		}
 
 	return NULL;
 }
@@ -633,11 +707,13 @@ void trusty_app_forall(void (*fn)(trusty_app_t *ta, void *data), void *data)
 	u_int i;
 	trusty_app_t *ta;
 
-	if (fn == NULL)
+	if (fn == NULL) {
 		return;
+	}
 
-	for (i = 0, ta = trusty_app_list; i < trusty_app_count; i++, ta++)
+	for (i = 0, ta = trusty_app_list; i < trusty_app_count; i++, ta++) {
 		fn(ta, data);
+	}
 }
 
 static void start_apps(uint level)
@@ -649,10 +725,15 @@ static void start_apps(uint level)
 	for (i = 0, trusty_app = trusty_app_list; i < trusty_app_count; i++, trusty_app++) {
 		if (trusty_app->ut->entry) {
 			ret = uthread_start(trusty_app->ut);
-			if (ret)
+			if (ret) {
 				panic("Cannot start Trusty app!\n");
+			}
 		}
 	}
+	tegra_boot_profiler_record("start_apps: Done");
+	/* Debug only: Prints all profiler records to UART during boot */
+	/* tegra_boot_profiler_data_printnow(); */
+	tegra_boot_profiler_deinit();
 }
 
 LK_INIT_HOOK(libtrusty_apps, start_apps, LK_INIT_LEVEL_APPS + 1);

@@ -44,4 +44,10 @@
 #define BUILDID_STR ""
 #endif
 
-char lk_version[] = VERSION_STR BUILDID_STR "Built: " __TIME__ " " __DATE__;
+#ifdef BUILDTIMESTAMP
+#define BUILDTIMESTAMP_STR "Built:" TOSTRING(BUILDTIMESTAMP)
+#else
+#define BUILDTIMESTAMP_STR "Built: " __TIME__ " " __DATE__ " "
+#endif
+
+char lk_version[] = VERSION_STR BUILDID_STR BUILDTIMESTAMP_STR ;

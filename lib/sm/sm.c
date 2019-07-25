@@ -27,6 +27,7 @@
 #include <kernel/mutex.h>
 #include <kernel/thread.h>
 #include <kernel/vm.h>
+#include <boot_profiler.h>
 #include <lib/heap.h>
 #include <lib/sm.h>
 #include <lib/sm/smcall.h>
@@ -36,7 +37,6 @@
 #include <sys/types.h>
 
 #define LOCAL_TRACE	0
-
 
 struct sm_std_call_state {
 	spin_lock_t lock;
@@ -83,9 +83,9 @@ long smc_sm_api_version(smc32_args_t *args)
 	spin_lock(&sm_api_version_lock);
 	if (!sm_api_version_locked) {
 		LTRACEF("request api version %d\n", api_version);
-		if (api_version > TRUSTY_API_VERSION_CURRENT)
+		if (api_version > TRUSTY_API_VERSION_CURRENT) {
 			api_version = TRUSTY_API_VERSION_CURRENT;
-
+		}
 		sm_api_version = api_version;
 	} else {
 		TRACEF("ERROR: Tried to select api version %d after use, current version %d\n",
@@ -268,12 +268,13 @@ static long sm_get_stdcall_ret(void)
 		LTRACEF("cpu %d, return stdcall result, %ld, initial cpu %d\n",
 			cpu, stdcallstate.ret, stdcallstate.initial_cpu);
 	} else {
-		if (sm_get_api_version() >= TRUSTY_API_VERSION_SMP) /* ns using new api */
+		if (sm_get_api_version() >= TRUSTY_API_VERSION_SMP) {/* ns using new api */
 			ret = SM_ERR_CPU_IDLE;
-		else if (stdcallstate.restart_count)
+		} else if (stdcallstate.restart_count) {
 			ret = SM_ERR_BUSY;
-		else
+		} else {
 			ret = SM_ERR_INTERRUPTED;
+		}
 		LTRACEF("cpu %d, initial cpu %d, restart_count %d, std call not finished, return %ld\n",
 			cpu, stdcallstate.initial_cpu,
 			stdcallstate.restart_count, ret);
@@ -302,11 +303,11 @@ static void sm_wait_for_smcall(void)
 		thread_yield();
 
 		cpu = arch_curr_cpu_num();
-		if (cpu == stdcallstate.active_cpu)
+		if (cpu == stdcallstate.active_cpu) {
 			ret = sm_get_stdcall_ret();
-		else
+		} else {
 			ret = SM_ERR_NOP_DONE;
-
+		}
 		sm_return_and_wait_for_next_stdcall(ret, cpu);
 
 		/* Re-enable interrupts (needed for SMC_SC_NOP) */
@@ -372,7 +373,8 @@ LK_INIT_HOOK_FLAGS(libsm_cpu, sm_secondary_init, LK_INIT_LEVEL_PLATFORM - 2, LK_
 
 static void sm_init(uint level)
 {
-	status_t err;
+	status_t err = NO_ERROR;
+	uint32_t ret = 0U;
 
 	mutex_acquire(&boot_args_lock);
 
@@ -393,7 +395,20 @@ static void sm_init(uint level)
 			boot_args_refcnt++;
 		} else {
 			boot_args = NULL;
-			TRACEF("Error mapping boot parameter block: %d\n", err);
+			TRACEF("Error mapping initial boot parameter block: %d\n", err);
+		}
+	}
+	/*
+	* Map paddr recieved from MB2 profiler
+	* This is the NS-DRAM offset for TOS boot profiler to add logs
+	* TOS Profiler can then add records to the same buffer as MB2 logs
+	*/
+	if ((void *)lk_boot_args[3] != NULL){
+		dprintf(SPEW,"Profiler Carveout base paddr: %p \n",(void*)lk_boot_args[3]);
+		/* Send the NS DRAM address to profiling library */
+		ret = tegra_boot_profiler_init(lk_boot_args[3]);
+		if(ret) {
+			TRACEF("Error mapping Profiler boot parameter block: %d\n", ret);
 		}
 	}
 
@@ -446,9 +461,9 @@ status_t sm_get_boot_args(void **boot_argsp, size_t *args_sizep)
 {
 	status_t err = NO_ERROR;
 
-	if (!boot_argsp || !args_sizep)
+	if (!boot_argsp || !args_sizep) {
 		return ERR_INVALID_ARGS;
-
+	}
 	mutex_acquire(&boot_args_lock);
 
 	if (!boot_args) {
@@ -471,10 +486,12 @@ static void resume_nsthreads(void)
 	ns_threads_started = true;
 	smp_wmb();
 	for (i = 0; i < SMP_MAX_CPUS; i++) {
-		if (nsirqthreads[i])
+		if (nsirqthreads[i]) {
 			thread_resume(nsirqthreads[i]);
-		if (nsidlethreads[i])
+		}
+		if (nsidlethreads[i]) {
 			thread_resume(nsidlethreads[i]);
+		}
 	}
 }
 
@@ -509,9 +526,10 @@ static void sm_release_boot_args(uint level)
 		resume_nsthreads();
 	}
 
-	if (boot_args)
+	if (boot_args) {
 		TRACEF("WARNING: outstanding reference to boot args"
 				"at the end of initialzation!\n");
+	}
 }
 
 LK_INIT_HOOK(libsm_bootargs, sm_release_boot_args, LK_INIT_LEVEL_LAST);

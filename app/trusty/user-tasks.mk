@@ -53,13 +53,18 @@ ALLUSER_TASK_OBJS := $(foreach t, $(TRUSTY_ALL_USER_TASKS),\
 ALLUSER_TASK_OBJS := $(addprefix $(BUILDDIR)/user_tasks/,$(ALLUSER_TASK_OBJS))
 
 # Add prebuilt user tasks
-ALLUSER_TASK_OBJS += $(TRUSTY_PREBUILT_USER_TASKS)
+ALLUSER_TASK_OBJS := $(TRUSTY_PREBUILT_USER_TASKS) $(ALLUSER_TASK_OBJS)
 
 #
 # Generate build rules for each user task
 #
 $(foreach t,$(TRUSTY_ALL_USER_TASKS),\
    $(call user-task-build-rule,$(t)))
+
+#if defined(TRUSTY_EMBEDDED_BUILD)
+$(foreach t,$(TRUSTY_ALL_USER_TASKS_BUILD_ONLY),\
+   $(call user-task-build-rule,$(t)))
+#endif
 
 #
 # Generate combined user task obj/bin if necessary

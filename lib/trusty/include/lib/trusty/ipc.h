@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2013, Google, Inc. All rights reserved
+ * Copyright (c) 2017, NVIDIA Corporation. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -145,7 +146,7 @@ enum {
 	IPC_CONNECT_MASK = IPC_CONNECT_WAIT_FOR_PORT
 			 | IPC_CONNECT_ASYNC,
 };
-int ipc_port_connect_async(const uuid_t *cid, const char *path, size_t max_path,
+int ipc_port_connect_async(uint32_t guest, const uuid_t *cid, const char *path, size_t max_path,
 			   uint flags, handle_t **chandle_ptr);
 
 bool ipc_is_channel(handle_t *handle);

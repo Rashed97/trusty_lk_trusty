@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2014-2015, Google, Inc. All rights reserved
+ * Copyright (c) 2017, NVIDIA Corporation. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -45,6 +46,8 @@
 #include <lib/trusty/ipc.h>
 #include <lib/trusty/ipc_msg.h>
 #include <lib/trusty/tipc_dev.h>
+#include <lib/trusty/hyp.h>
+#include <lib/trusty/trusty_guest_ctx.h>
 
 #define LOCAL_TRACE  0
 
@@ -80,6 +83,7 @@ struct tipc_ept {
 
 struct tipc_dev {
 	struct vdev		vd;
+	uint32_t		guest;
 	const uuid_t		*uuid;
 	const void		*descr_ptr;
 	size_t			descr_size;
@@ -301,7 +305,7 @@ static int handle_conn_req(struct tipc_dev *dev, uint32_t remote,
 	strncpy(req.name, (const char *)ns_req->name, sizeof(req.name));
 
 	/* open ipc channel */
-	err = ipc_port_connect_async(dev->uuid, req.name, sizeof(req.name),
+	err = ipc_port_connect_async(dev->guest, dev->uuid, req.name, sizeof(req.name),
 				     0, &chan);
 	if (err == NO_ERROR) {
 		mutex_acquire(&dev->ept_lock);
@@ -323,7 +327,7 @@ static int handle_conn_req(struct tipc_dev *dev, uint32_t remote,
 		return NO_ERROR;
 	}
 
-	err = send_conn_rsp(dev, local, remote, ERR_NO_RESOURCES, 0, 0);
+	err = send_conn_rsp(dev, local, remote, (uint32_t)err, 0, 0);
 	if (err) {
 		TRACEF("failed (%d) to send response\n", err);
 	}
@@ -403,18 +407,20 @@ static int handle_ctrl_msg(struct tipc_dev *dev, uint32_t remote,
 	msg_body_len = ns_msg_hdr->body_len;
 	ns_msg_body = ns_data + sizeof(struct tipc_ctrl_msg_hdr);
 
-	if (sizeof(struct tipc_ctrl_msg_hdr) + msg_body_len != msg_len)
+	if (sizeof(struct tipc_ctrl_msg_hdr) + msg_body_len != msg_len) {
 		goto err_mailformed_msg;
-
+	}
 	switch (msg_type) {
 	case TIPC_CTRL_MSGTYPE_CONN_REQ:
-		if (msg_body_len != sizeof(struct tipc_conn_req_body))
+		if (msg_body_len != sizeof(struct tipc_conn_req_body)) {
 			break;
+		}
 		return handle_conn_req(dev, remote, ns_msg_body);
 
 	case TIPC_CTRL_MSGTYPE_DISC_REQ:
-		if (msg_body_len != sizeof(struct tipc_disc_req_body))
+		if (msg_body_len != sizeof(struct tipc_disc_req_body)) {
 			break;
+		}
 		return handle_disc_req(dev, remote, ns_msg_body);
 
 	default:
@@ -488,7 +494,7 @@ static int handle_rx_msg(struct tipc_dev *dev, struct vqueue_buf *buf)
 	/* map in_iovs, Non-secure, no-execute, cached, read-only */
 	uint map_flags = ARCH_MMU_FLAG_NS | ARCH_MMU_FLAG_PERM_NO_EXECUTE |
 	                 ARCH_MMU_FLAG_CACHED | ARCH_MMU_FLAG_PERM_RO;
-	int ret = vqueue_map_iovs(&buf->in_iovs, map_flags);
+	int ret = vqueue_map_iovs(&buf->in_iovs, map_flags, dev->guest);
 	if (ret) {
 		TRACEF("failed to map iovs %d\n", ret);
 		return ret;
@@ -514,11 +520,11 @@ static int handle_rx_msg(struct tipc_dev *dev, struct vqueue_buf *buf)
 		goto done;
 	}
 
-	if (dst_addr == TIPC_CTRL_ADDR)
+	if (dst_addr == TIPC_CTRL_ADDR) {
 		ret = handle_ctrl_msg(dev, src_addr, ns_data, ns_data_len);
-	else
+	} else {
 		ret = handle_chan_msg(dev, src_addr, dst_addr, ns_data, ns_data_len);
-
+	}
 done:
 	vqueue_unmap_iovs(&buf->in_iovs);
 
@@ -548,20 +554,20 @@ static int tipc_rx_thread_func(void *arg)
 
 		ret = vqueue_get_avail_buf(vq, &buf);
 
-		if (ret == ERR_CHANNEL_CLOSED)
+		if (ret == ERR_CHANNEL_CLOSED) {
 			break;  /* need to terminate */
-
-		if (ret == ERR_NOT_ENOUGH_BUFFER)
+		}
+		if (ret == ERR_NOT_ENOUGH_BUFFER) {
 			continue;  /* no new messages */
-
+		}
 		if (likely(ret == NO_ERROR)) {
 			ret = handle_rx_msg(dev, &buf);
 		}
 
 		ret = vqueue_add_buf(vq, &buf, ret);
-		if (ret == ERR_CHANNEL_CLOSED)
+		if (ret == ERR_CHANNEL_CLOSED) {
 			break;  /* need to terminate */
-
+		}
 		if (ret != NO_ERROR) {
 			/* any other error is only possible if
 			 * vqueue is corrupted.
@@ -627,9 +633,9 @@ static void handle_tx_msg(struct tipc_dev *dev, handle_t *chan)
 		/* get next message info */
 		ret = ipc_get_msg(chan, &cb_ctx.msg_inf);
 
-		if (ret == ERR_NO_MSG)
+		if (ret == ERR_NO_MSG) {
 			break; /* no new messages */
-
+		}
 		if (ret != NO_ERROR) {
 			/* should never happen */
 			panic ("%s: failed (%d) to get message\n",
@@ -781,8 +787,9 @@ static status_t tipc_dev_reset(struct tipc_dev *dev)
 
 	LTRACEF("devid=%d\n", dev->vd.devid);
 
-	if (dev->vd.state == VDEV_STATE_RESET)
+	if (dev->vd.state == VDEV_STATE_RESET) {
 		return NO_ERROR;
+	}
 
 	/* Shutdown rx thread to block all incomming requests */
 	dev->rx_stop = true;
@@ -802,12 +809,12 @@ static status_t tipc_dev_reset(struct tipc_dev *dev)
 	mutex_acquire(&dev->ept_lock);
 	ept = dev->epts;
 	for (uint slot  = 0; slot < countof(dev->epts); slot++, ept++) {
-		if (!bitmap_test(dev->inuse, slot))
+		if (!bitmap_test(dev->inuse, slot)) {
 			continue;
-
-		if (!ept->chan)
+		}
+		if (!ept->chan) {
 			continue;
-
+		}
 		handle_list_del(&dev->handle_list, ept->chan);
 		handle_set_cookie(ept->chan, NULL);
 		handle_close(ept->chan);
@@ -909,13 +916,13 @@ static status_t tipc_dev_probe(struct tipc_dev *dev,
 
 	LTRACEF("%p: descr = %p\n", dev, dscr);
 
-	if (dev->vd.state != VDEV_STATE_RESET)
+	if (dev->vd.state != VDEV_STATE_RESET) {
 		return ERR_BAD_STATE;
-
+	}
 	ret = validate_descr(dev, dscr);
-	if (ret != NO_ERROR)
+	if (ret != NO_ERROR) {
 		return ret;
-
+	}
 	/* vring[0] == TX queue (host's RX) */
 	/* vring[1] == RX queue (host's TX) */
 	for (vring_cnt = 0; vring_cnt < dscr->vdev.num_of_vrings; vring_cnt++) {
@@ -940,10 +947,12 @@ static status_t tipc_dev_probe(struct tipc_dev *dev,
 		ret = vqueue_init(&dev->vqs[vring_cnt],
 				  vring->notifyid, (paddr_t)pa64,
 				  vring->num, vring->align, dev,
-				  notify_cbs[vring_cnt], NULL);
-		if (ret)
+				  notify_cbs[vring_cnt], NULL, dev->guest);
+		if (ret) {
 			goto err_vq_init;
+		}
 	}
+
 
 	/* create rx thread */
 	snprintf(tname, sizeof(tname), "tipc-dev%d-rx", dev->vd.devid);
@@ -1017,13 +1026,14 @@ tipc_send_data(struct tipc_dev *dev, uint32_t local, uint32_t remote,
 	struct vqueue *vq = &dev->vqs[TIPC_VQ_TX];
 	struct vqueue_buf buf;
 	int ret = 0;
+	uint map_flags = 0;
 
 	DEBUG_ASSERT(dev);
 
 	/* check if data callback specified */
-	if (!cb)
+	if (!cb) {
 		return ERR_INVALID_ARGS;
-
+	}
 	size_t ttl_len =
 	sizeof(struct tipc_hdr) + data_len;
 
@@ -1076,9 +1086,9 @@ tipc_send_data(struct tipc_dev *dev, uint32_t local, uint32_t remote,
 	}
 
 	/* map in provided buffers (Non-secure, no-execute, cached, read-write) */
-	uint map_flags = ARCH_MMU_FLAG_NS | ARCH_MMU_FLAG_PERM_NO_EXECUTE |
+	map_flags = ARCH_MMU_FLAG_NS | ARCH_MMU_FLAG_PERM_NO_EXECUTE |
 	                 ARCH_MMU_FLAG_CACHED;
-	ret = vqueue_map_iovs(&buf.out_iovs, map_flags);
+	ret = vqueue_map_iovs(&buf.out_iovs, map_flags, dev->guest);
 	if (ret == NO_ERROR) {
 		struct tipc_hdr *hdr = buf.out_iovs.iovs[0].base;
 
@@ -1151,7 +1161,8 @@ static const struct vdev_ops _tipc_dev_ops = {
 };
 
 status_t create_tipc_device(const struct tipc_vdev_descr *descr, size_t size,
-                            const uuid_t *uuid, struct tipc_dev **dev_ptr)
+                            const uuid_t *uuid, uint32_t guest,
+                            struct tipc_dev **dev_ptr)
 {
 	status_t ret;
 	struct tipc_dev *dev;
@@ -1161,29 +1172,29 @@ status_t create_tipc_device(const struct tipc_vdev_descr *descr, size_t size,
 	DEBUG_ASSERT(size);
 
 	dev = calloc(1, sizeof(*dev));
-	if (!dev)
+	if (!dev) {
 		return ERR_NO_MEMORY;
-
+	}
 	mutex_init(&dev->ept_lock);
 	dev->vd.ops = &_tipc_dev_ops;
 	dev->uuid = uuid;
+	dev->guest = guest;
 	dev->descr_ptr = descr;
 	dev->descr_size = size;
 	handle_list_init(&dev->handle_list);
 	event_init(&dev->have_handles, false, EVENT_FLAG_AUTOUNSIGNAL);
 
-	ret = virtio_register_device(&dev->vd);
-	if (ret != NO_ERROR)
+	ret = virtio_register_device(&dev->vd, guest);
+	if (ret != NO_ERROR) {
 		goto err_register;
-
-	if (dev_ptr)
+	}
+	if (dev_ptr) {
 		*dev_ptr = dev;
-
+	}
 	return NO_ERROR;
 
 err_register:
 	free(dev);
 	return ret;
 }
-
 

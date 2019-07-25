@@ -46,6 +46,11 @@ MODULE_CFLAGS += \
 	-DBUILDID=$(BUILDID)
 endif
 
+ifneq ($(BUILDTIMESTAMP),)
+MODULE_CFLAGS += \
+	-DBUILDTIMESTAMP=$(BUILDTIMESTAMP)
+endif
+
 include make/module.mk
 
 EXTRA_BUILDRULES += lib/version/version.mk

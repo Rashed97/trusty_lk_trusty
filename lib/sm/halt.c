@@ -35,6 +35,7 @@ void platform_halt(platform_halt_action suggested_action,
     dprintf(ALWAYS, "HALT: (reason = %d)\n", reason);
     arch_disable_ints();
     arch_disable_fiqs();
-    while(true)
+    while(true) {
         sm_sched_nonsecure(SM_ERR_PANIC, &args);
+    }
 }

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2015 Google Inc. All rights reserved
+ * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -34,6 +35,14 @@
  * physically contiguous, read-writable and 4k aligned) for now.
  */
 #define MMAP_FLAG_IO_HANDLE		(0x1 << 0)
+
+/*
+ * Anonymously maps memory region to user address space and marks it as device memory.
+ * The memory region is only accessable by that process. Device memory cannot be
+ * speculatively accessed, and is primarily intended to be used for storage of secrets
+ * to help protect them against side-channel cache-timing attacks.
+ */
+#define MMAP_FLAG_DEVICE_MEM		(0x1 << 1)
 
 /**
  * struct dma_pmem - a contiguous physical memory block

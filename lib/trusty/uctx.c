@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2013, Google, Inc. All rights reserved
+ * Copyright (c) 2017, NVIDIA Corporation. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -33,6 +34,7 @@
 #include <sys/types.h>
 #include <trace.h>
 #include <uthread.h>
+#include <platform/speculation_barrier.h>
 
 #include <kernel/event.h>
 #include <kernel/thread.h>
@@ -46,9 +48,11 @@
 #include <lib/trusty/handle.h>
 #include <lib/trusty/trusty_app.h>
 #include <lib/trusty/uctx.h>
+#include <lib/trusty/ipc.h>
+#include <lib/trusty/trusty_guest_ctx.h>
 
 /* must be a multiple of sizeof(unsigned long) */
-#define IPC_MAX_HANDLES		64
+#define IPC_MAX_HANDLES		128
 
 struct uctx {
 	unsigned long		inuse[BITMAP_NUM_WORDS(IPC_MAX_HANDLES)];
@@ -56,6 +60,7 @@ struct uctx {
 
 	void			*priv;
 	handle_list_t		handle_list;
+	uint32_t 		cur_guest;
 };
 
 static status_t _uctx_startup(trusty_app_t *app);
@@ -65,14 +70,28 @@ static struct trusty_app_notifier _uctx_notifier = {
 	.startup = _uctx_startup,
 };
 
+/*
+ * The cur_guest parameter is updated into a TA's uctx structure
+ * when the wait on its functions such as port connect, channel
+ * connect, message exchange are signalled.
+ * If get_current_guest() is called before such events
+ * have happened on that TA, a default guest id would be returned.
+ */
+uint32_t uctx_get_current_guest(void)
+{
+	uctx_t *ctx = current_uctx();
+
+	return ctx->cur_guest;
+}
+
 static status_t _uctx_startup(trusty_app_t *app)
 {
 	uctx_t *uctx;
 
 	int err = uctx_create(app, &uctx);
-	if (err)
+	if (err) {
 		return err;
-
+	}
 	trusty_als_set(app, _uctx_slot_id, uctx);
 	return NO_ERROR;
 }
@@ -83,14 +102,16 @@ static void uctx_init(uint level)
 
 	/* allocate als slot */
 	res = trusty_als_alloc_slot();
-	if (res < 0)
+	if (res < 0) {
 		panic("failed (%d) to alloc als slot\n", res);
+	}
 	_uctx_slot_id = res;
 
 	/* register notifier */
 	res = trusty_register_app_notifier(&_uctx_notifier);
-	if (res < 0)
+	if (res < 0) {
 		panic("failed (%d) to register uctx notifier\n", res);
+	}
 }
 
 LK_INIT_HOOK(uctx, uctx_init, LK_INIT_LEVEL_APPS - 2);
@@ -163,6 +184,7 @@ int uctx_create(void *priv, uctx_t **ctx)
 	}
 
 	new_ctx->priv = priv;
+	new_ctx->cur_guest = DEFAULT_GUEST_ID;
 
 	handle_list_init(&new_ctx->handle_list);
 
@@ -213,9 +235,9 @@ int uctx_handle_install(uctx_t *ctx, handle_t *handle, handle_id_t *id)
 	DEBUG_ASSERT(id);
 
 	new_id = bitmap_ffz(ctx->inuse, IPC_MAX_HANDLES);
-	if (new_id < 0)
+	if (new_id < 0) {
 		return ERR_NO_RESOURCES;
-
+	}
 	ASSERT(ctx->handles[new_id] == NULL);
 
 	bitmap_set(ctx->inuse, new_id);
@@ -237,6 +259,10 @@ int uctx_handle_get(uctx_t *ctx, handle_id_t handle_id, handle_t **handle_ptr)
 
 	int ret = _check_handle_id (ctx, handle_id);
 	if (ret == NO_ERROR) {
+
+		/* Barrier against speculating handles[handle_id] */
+		platform_arch_speculation_barrier();
+
 		handle_t *handle = ctx->handles[handle_id];
 		/* take a reference on the handle we looked up */
 		handle_incref(handle);
@@ -257,6 +283,10 @@ int uctx_handle_remove(uctx_t *ctx, handle_id_t handle_id, handle_t **handle_ptr
 
 	int ret = _check_handle_id(ctx, handle_id);
 	if (ret == NO_ERROR) {
+
+		/* Barrier against speculating handles[handle_id] */
+		platform_arch_speculation_barrier();
+
 		handle_t *handle = ctx->handles[handle_id];
 		bitmap_clear(ctx->inuse, handle_id);
 		ctx->handles[handle_id] = NULL;
@@ -277,6 +307,42 @@ typedef struct uevent {
 	user_addr_t		cookie;
 } uevent_t;
 
+static void set_current_guest(handle_t *handle)
+{
+	uctx_t *ctx = current_uctx();
+
+	if (handle == NULL) {
+		TRACEF("%s: handle pointer NULL\n", __func__);
+		return;
+	}
+
+	ctx->cur_guest = handle->guest_id;
+	LTRACEF("handle->guestid = %x ", handle->guest_id);
+}
+
+/*
+ *   Called by user thread in kernel context
+ *   get the id of the guest VM running the TA
+ */
+long __SYSCALL sys_get_guest_id(user_addr_t user_addr)
+{
+	uctx_t *ctx = current_uctx();
+
+	if (uthread_is_valid_range(uthread_get_current(),
+				user_addr, sizeof(ctx->cur_guest))) {
+		status_t status = copy_to_user(user_addr,
+				&ctx->cur_guest, sizeof(ctx->cur_guest));
+		if (status) {
+			TRACEF("failed to copy guest id status = %d\n", status);
+			return status;
+		}
+
+		return NO_ERROR;
+	}
+
+	return ERR_INVALID_ARGS;
+}
+
 /*
  *   wait on single handle specified by handle id
  */
@@ -292,9 +358,9 @@ long __SYSCALL sys_wait(uint32_t handle_id, user_addr_t user_event,
 	                                handle_id, timeout_msecs);
 
 	ret = uctx_handle_get(ctx, handle_id, &handle);
-	if (ret != NO_ERROR)
+	if (ret != NO_ERROR) {
 		return ret;
-
+	}
 	DEBUG_ASSERT(handle);
 
 	ret = handle_wait(handle, &tmp_event.event,
@@ -312,6 +378,9 @@ long __SYSCALL sys_wait(uint32_t handle_id, user_addr_t user_event,
 	if (status) {
 		/* failed to copy, propogate error to caller */
 		ret = (long) status;
+	} else {
+		set_current_guest(handle);
+		LTRACEF("event = %u\n", tmp_event.event);
 	}
 
 out:
@@ -332,10 +401,10 @@ long __SYSCALL sys_wait_any(user_addr_t user_event, unsigned long timeout_msecs)
 	handle_t *handle;
 	uevent_t tmp_event;
 	int ret;
+	status_t status;
 
 	LTRACEF("[%p]: %ld msec\n", uthread_get_current(),
 	                            timeout_msecs);
-
 	/*
 	 * Get a handle that has a pending event. The returned handle has
 	 * extra ref taken.
@@ -358,10 +427,13 @@ long __SYSCALL sys_wait_any(user_addr_t user_event, unsigned long timeout_msecs)
 	/* there should be a handle id */
 	DEBUG_ASSERT(tmp_event.handle < IPC_MAX_HANDLES);
 
-	status_t status = copy_to_user(user_event, &tmp_event, sizeof(tmp_event));
+	status = copy_to_user(user_event, &tmp_event, sizeof(tmp_event));
 	if (status) {
 		/* failed to copy, propogate error to caller */
 		ret = status;
+	} else {
+		set_current_guest(handle);
+		LTRACEF("event = %u\n", tmp_event.event);
 	}
 out:
 	LTRACEF("[%p][%d]: ret = %d\n", uthread_get_current(),
@@ -377,9 +449,9 @@ long __SYSCALL sys_close(uint32_t handle_id)
 	                      handle_id);
 
 	int ret = uctx_handle_remove(current_uctx(), handle_id, &handle);
-	if (ret != NO_ERROR)
+	if (ret != NO_ERROR) {
 		return ret;
-
+	}
 	handle_close(handle);
 	return NO_ERROR;
 }
@@ -392,9 +464,9 @@ long __SYSCALL sys_set_cookie(uint32_t handle_id, user_addr_t cookie)
 	                              handle_id, (uint) cookie);
 
 	int ret = uctx_handle_get(current_uctx(), handle_id, &handle);
-	if (ret != NO_ERROR)
+	if (ret != NO_ERROR) {
 		return ret;
-
+	}
 	handle_set_cookie(handle, (void *)(uintptr_t)cookie);
 
 	handle_decref(handle);
@@ -402,6 +474,11 @@ long __SYSCALL sys_set_cookie(uint32_t handle_id, user_addr_t cookie)
 }
 
 #else  /* WITH_TRUSTY_IPC */
+
+long __SYSCALL sys_get_guest_id(user_addr_t user_addr)
+{
+	return (long) ERR_NOT_SUPPORTED;
+}
 
 long __SYSCALL sys_wait(uint32_t handle_id, user_addr_t user_event,
                         unsigned long timeout_msecs)
@@ -426,7 +503,5 @@ long __SYSCALL sys_set_cookie(uint32_t handle_id, user_addr_t cookie)
 }
 
 #endif /* WITH_TRUSTY_IPC */
-
-
 
 

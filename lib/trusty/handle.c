@@ -39,6 +39,7 @@
 
 #include <lib/syscall.h>
 #include <lib/trusty/ipc.h>
+#include <lib/trusty/trusty_guest_ctx.h>
 
 void handle_init(handle_t *handle, struct handle_ops *ops)
 {
@@ -51,6 +52,7 @@ void handle_init(handle_t *handle, struct handle_ops *ops)
 	handle->wait_event = NULL;
 	spin_lock_init(&handle->slock);
 	handle->cookie = NULL;
+	handle->guest_id = DEFAULT_GUEST_ID;
 	list_clear_node(&handle->hlist_node);
 }
 
@@ -77,8 +79,9 @@ void handle_decref(handle_t *handle)
 void handle_close(handle_t *handle)
 {
 	DEBUG_ASSERT(handle);
-	if (handle->ops->shutdown)
+	if (handle->ops->shutdown) {
 		handle->ops->shutdown(handle);
+	}
 	handle_decref(handle);
 }
 
@@ -125,9 +128,9 @@ int handle_wait(handle_t *handle, uint32_t *handle_event, lk_time_t timeout)
 	event_t ev;
 	int ret = 0;
 
-	if (!handle || !handle_event)
+	if (!handle || !handle_event) {
 		return ERR_INVALID_ARGS;
-
+	}
 	event_init(&ev, false, EVENT_FLAG_AUTOUNSIGNAL);
 
 	ret = _prepare_wait_handle(&ev, handle);
@@ -138,15 +141,18 @@ int handle_wait(handle_t *handle, uint32_t *handle_event, lk_time_t timeout)
 
 	while (true) {
 		event = handle->ops->poll(handle);
-		if (event)
+		if (event) {
 			break;
+		}
 		ret = __do_wait(&ev, timeout);
-		if (ret < 0)
+		if (ret < 0) {
 			goto finish_wait;
+		}
 	}
 
-	if (handle->ops->finalize_event)
+	if (handle->ops->finalize_event) {
 		handle->ops->finalize_event(handle, event);
+	}
 	*handle_event = event;
 	ret = NO_ERROR;
 
@@ -262,8 +268,9 @@ static void _hlist_finish_wait_locked(handle_list_t *hlist, handle_t *last)
 	handle_t *handle;
 	list_for_every_entry(&hlist->handles, handle, handle_t, hlist_node) {
 		_finish_wait_handle(handle);
-		if (handle == last)
+		if (handle == last) {
 			break;
+		}
 	}
 }
 
@@ -275,7 +282,7 @@ static void _hlist_finish_wait_locked(handle_list_t *hlist, handle_t *last)
 static int _hlist_do_poll_locked(handle_list_t *hlist, handle_t **handle_ptr,
 				 uint32_t *event_ptr, bool prepare)
 {
-	int ret;
+	int ret = 0;
 
 	DEBUG_ASSERT(hlist->wait_event);
 
@@ -332,9 +339,9 @@ int handle_list_wait(handle_list_t *hlist, handle_t **handle_ptr,
 
 	hlist->wait_event = &ev;
 	ret = _hlist_do_poll_locked(hlist, handle_ptr, event_ptr, true);
-	if (ret < 0)
+	if (ret < 0) {
 		goto err_do_poll;
-
+	}
 	if (ret == 0) {
 		/* no handles ready */
 		do {
@@ -342,9 +349,9 @@ int handle_list_wait(handle_list_t *hlist, handle_t **handle_ptr,
 			ret = __do_wait(&ev, timeout);
 			mutex_acquire(&hlist->lock);
 
-			if (ret < 0)
+			if (ret < 0) {
 				break;
-
+			}
 			/* poll again */
 			ret = _hlist_do_poll_locked(hlist, handle_ptr,
 						    event_ptr, false);
@@ -356,9 +363,9 @@ int handle_list_wait(handle_list_t *hlist, handle_t **handle_ptr,
 	if (ret == 1) {
 		handle_t *handle = *handle_ptr;
 
-		if (handle->ops->finalize_event)
+		if (handle->ops->finalize_event) {
 			handle->ops->finalize_event(handle, *event_ptr);
-
+		}
 		handle_incref(handle);
 
 		/* move list head after item we just found */

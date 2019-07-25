@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2013, Google Inc. All rights reserved
+ * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -30,6 +31,7 @@
 #include <trace.h>
 
 #include <kernel/mutex.h>
+#include <mm.h>
 
 #include <arch/uthread_mmu.h>  // for MAX_USR_VA
 
@@ -39,6 +41,11 @@ static struct list_node uthread_list;
 /* Monotonically increasing thread id for now */
 static uint32_t next_utid;
 static spin_lock_t uthread_lock;
+
+/* forward declarations of utility functions */
+vm_page_t *address_to_page(paddr_t addr);
+paddr_t page_to_address(const vm_page_t *page);
+
 
 static inline void mmap_lock(uthread_t *ut)
 {
@@ -84,20 +91,20 @@ static vaddr_t uthread_find_va_space_ns(uthread_t *ut, size_t size, u_int align)
 	while (mp) {
 		if (start >= mp->vaddr + mp->size) { /* found gap */
 
-			if (start >= ut->ns_va_bottom)
+			if (start >= ut->ns_va_bottom) {
 				break; /* the whole map fits above ns_va_bottom */
-
+			}
 			/* check if we can move ns_va_bottom */
 			DEBUG_ASSERT((mp->flags & UTM_NS_MEM) == 0);
-			if (ROUNDDOWN(start, UT_MAP_ALIGN_1MB) < mp->vaddr + mp->size)
+			if (ROUNDDOWN(start, UT_MAP_ALIGN_1MB) < mp->vaddr + mp->size) {
 				return (vaddr_t) NULL; /*  nope, we can't */
-
+			}
 			break;
 		}
 
-		if (!(mp->flags & UTM_NS_MEM))
+		if (!(mp->flags & UTM_NS_MEM)) {
 			return (vaddr_t) NULL;  /* next mp is non-NS */
-
+		}
 		start = MIN(start, ROUNDDOWN((mp->vaddr - size), align));
 		end = start + size;
 
@@ -105,9 +112,9 @@ static vaddr_t uthread_find_va_space_ns(uthread_t *ut, size_t size, u_int align)
 		mp = list_prev_type(&ut->map_list, &mp->node, uthread_map_t, node);
 	}
 
-	if (start < ut->start_stack || start > end)
+	if (start < ut->start_stack || start > end) {
 		return (vaddr_t) NULL;
-
+	}
 	return start;
 }
 
@@ -121,26 +128,27 @@ static vaddr_t uthread_find_va_space_sec(uthread_t *ut, size_t size, u_int align
 
 	/* find first fit */
 	list_for_every_entry(&ut->map_list, mp, uthread_map_t, node) {
-		if (end <= mp->vaddr)
+		if (end <= mp->vaddr) {
 			break;
-
+		}
 		start = MAX(start, ROUNDUP((mp->vaddr + mp->size), align));
 		end = start + size;
 	}
 
-	if (end > ut->ns_va_bottom || start > end)
+	if (end > ut->ns_va_bottom || start > end) {
 		return (vaddr_t) NULL;
-
+	}
 	return start;
 }
 
 static vaddr_t uthread_find_va_space(uthread_t *ut, size_t size,
 		u_int flags, u_int align)
 {
-	if (flags & UTM_NS_MEM)
+	if (flags & UTM_NS_MEM) {
 		return uthread_find_va_space_ns(ut, size, align);
-	else
+	} else {
 		return uthread_find_va_space_sec(ut, size, align);
+	}
 }
 
 static status_t uthread_map_alloc(uthread_t *ut, uthread_map_t **mpp,
@@ -150,17 +158,18 @@ static status_t uthread_map_alloc(uthread_t *ut, uthread_map_t **mpp,
 	uthread_map_t *mp, *mp_lst;
 	status_t err = NO_ERROR;
 	uint32_t npages;
+	vaddr_t new_ns;
 
 	ASSERT(!(size & (PAGE_SIZE - 1)));
 
-	if (vaddr + size <= vaddr)
+	if (vaddr + size <= vaddr) {
 		return ERR_INVALID_ARGS;
-
-	if (flags & UTM_PHYS_CONTIG)
+	}
+	if (flags & UTM_PHYS_CONTIG) {
 		npages = 1;
-	else
+	} else {
 		npages = (size / PAGE_SIZE);
-
+	}
 	mp = malloc(sizeof(uthread_map_t) + (npages * sizeof(mp->pfn_list[0])));
 	if (!mp) {
 		err = ERR_NO_MEMORY;
@@ -174,7 +183,7 @@ static status_t uthread_map_alloc(uthread_t *ut, uthread_map_t **mpp,
 	memcpy(mp->pfn_list, pfn_list, npages*sizeof(paddr_t));
 
 
-	vaddr_t new_ns = ut->ns_va_bottom;
+	new_ns = ut->ns_va_bottom;
 	if ((mp->flags & UTM_NS_MEM) && (mp->vaddr < ut->ns_va_bottom)) {
 		/* Move ns_va_bottom down.
 		   It is verified during NS VA allocation */
@@ -201,15 +210,17 @@ static status_t uthread_map_alloc(uthread_t *ut, uthread_map_t **mpp,
 	ut->ns_va_bottom = new_ns;
 	list_add_tail(&ut->map_list, &mp->node);
 out:
-	if (mpp)
+	if (mpp) {
 		*mpp = mp;
+	}
 	return NO_ERROR;
 
 err_free_mp:
 	free(mp);
 err_out:
-	if (mpp)
+	if (mpp) {
 		*mpp = NULL;
+	}
 	return err;
 }
 
@@ -217,9 +228,9 @@ static uthread_map_t *uthread_map_find(uthread_t *ut, vaddr_t vaddr, size_t size
 {
 	uthread_map_t *mp = NULL;
 
-	if (vaddr + size < vaddr)
+	if (vaddr + size < vaddr) {
 		return NULL;
-
+	}
 	/* TODO: Fuzzy comparisions for now */
 	list_for_every_entry(&ut->map_list, mp, uthread_map_t, node) {
 		if ((mp->vaddr <= vaddr) &&
@@ -281,9 +292,9 @@ uthread_t *uthread_create(const char *name, vaddr_t entry, int priority,
 	spin_lock_saved_state_t state;
 
 	ut = (uthread_t *)calloc(1, sizeof(uthread_t));
-	if (!ut)
+	if (!ut) {
 		goto err_done;
-
+	}
 	list_initialize(&ut->map_list);
 	mutex_init(&ut->mmap_lock);
 
@@ -294,17 +305,17 @@ uthread_t *uthread_create(const char *name, vaddr_t entry, int priority,
 
 	/* Allocate and map in a stack region */
 	ut->stack = memalign(PAGE_SIZE, stack_size);
-	if(!ut->stack)
+	if(!ut->stack) {
 		goto err_free_ut;
-
+	}
 	stack_bot = start_stack - stack_size;
 	err = uthread_map_contig(ut, &stack_bot, vaddr_to_paddr(ut->stack),
 				stack_size,
 				UTM_W | UTM_R | UTM_STACK | UTM_FIXED,
 				UT_MAP_ALIGN_4KB);
-	if (err)
+	if (err) {
 		goto err_free_ut_stack;
-
+	}
 	ut->start_stack = start_stack;
 
 	ut->thread = thread_create(name,
@@ -312,13 +323,13 @@ uthread_t *uthread_create(const char *name, vaddr_t entry, int priority,
 			NULL,
 			priority,
 			DEFAULT_STACK_SIZE);
-	if (!ut->thread)
+	if (!ut->thread) {
 		goto err_free_ut_maps;
-
+	}
 	err = arch_uthread_create(ut);
-	if (err)
+	if (err) {
 		goto err_free_ut_maps;
-
+	}
 	/* store user thread struct into TLS slot 0 */
 	ut->thread->tls[TLS_ENTRY_UTHREAD] = (uintptr_t) ut;
 
@@ -345,9 +356,9 @@ err_done:
 
 status_t uthread_start(uthread_t *ut)
 {
-	if (!ut || !ut->thread)
+	if (!ut || !ut->thread) {
 		return ERR_INVALID_ARGS;
-
+	}
 	return thread_resume(ut->thread);
 }
 
@@ -404,9 +415,9 @@ static status_t uthread_map_locked(uthread_t *ut, vaddr_t *vaddrp,
 	}
 
 	err = uthread_map_alloc(ut, &mp, *vaddrp, pfn_list, size, flags, align);
-	if(err)
+	if(err) {
 		goto done;
-
+	}
 	err = arch_uthread_map(ut, mp);
 done:
 	return err;
@@ -423,10 +434,86 @@ status_t uthread_map(uthread_t *ut, vaddr_t *vaddrp, paddr_t *pfn_list,
 	return err;
 }
 
+/* Allocates physical memory and maps to uthread task */
+status_t uthread_pmm_alloc_and_map(uthread_t *ut, vaddr_t *vaddr,
+		size_t size, u_int flags, u_int align)
+{
+	uint32_t alloc_size = ROUNDUP(size, PAGE_SIZE);
+	u_int count = alloc_size >> PAGE_SIZE_SHIFT;
+	u_int allocated = 0;
+	u_int i;
+	struct list_node page_list = LIST_INITIAL_VALUE(page_list);
+
+	paddr_t *pfn_list;
+	status_t sts = -1;
+	vm_page_t *page;
+	uint32_t uthread_flags = 0;
+
+	list_initialize(&page_list);
+	if (vaddr == NULL)
+		return ERR_INVALID_ARGS;
+	*vaddr = NULL;
+
+	/* Allocate physical memory from the kernel */
+	allocated = pmm_alloc_pages(count, &page_list);
+	if (allocated != count) {
+		dprintf(ALWAYS, "%s: Failed to allocate enough pages (allocated %d, needed %d)\n",
+					__func__, allocated, count);
+		goto err_free_pages;
+	}
+
+	/* Get list of physical addresses of each page */
+	pfn_list = malloc(count * sizeof(*pfn_list));
+	if (pfn_list == NULL) {
+		dprintf(ALWAYS, "%s: malloc failed. Unable to allocate pfn (size %lu)\n",
+				__func__, count * sizeof(*pfn_list));
+		goto err_free_pages;
+	}
+
+	i = 0;
+	list_for_every_entry(&page_list, page, vm_page_t, node) {
+		pfn_list[i] = page_to_address(page);
+		dprintf(SPEW, "%s: Page address %lx\n", __func__, pfn_list[i]);
+
+		i++;
+	}
+	DEBUG_ASSERT(i == count);
+
+	/* Set the uthread_flags */
+	uthread_flags = UTM_W | UTM_R;
+	if (flags & MMAP_FLAG_DEVICE_MEM)
+		uthread_flags |= UTM_DEVICE;
+
+	sts = uthread_map(ut, vaddr, pfn_list, alloc_size,
+			uthread_flags, align);
+	if (sts) {
+		dprintf(ALWAYS, "%s: Mapping failed with Error: %x\n",
+				__func__, sts);
+		goto err_free_pfn;
+	}
+
+	/*
+	 * Invalidate cache for device memory to avoid data corruption
+	 * due to cache evictions which occur between run-time and boot-time
+	 */
+	if (uthread_flags & UTM_DEVICE)
+		arch_clean_cache_range(*vaddr, alloc_size);
+
+	free(pfn_list);
+	return 0;
+
+err_free_pfn:
+	free(pfn_list);
+err_free_pages:
+	pmm_free(&page_list);
+	return sts;
+}
+
 static status_t uthread_unmap_locked(uthread_t *ut, vaddr_t vaddr, size_t size)
 {
 	uthread_map_t *mp;
 	status_t err = NO_ERROR;
+	uint i = 0;
 
 	if (!ut || !vaddr) {
 		err = ERR_INVALID_ARGS;
@@ -440,8 +527,18 @@ static status_t uthread_unmap_locked(uthread_t *ut, vaddr_t vaddr, size_t size)
 	}
 
 	err = arch_uthread_unmap(ut, mp);
-	if (err)
+	if (err) {
 		goto done;
+	}
+
+	if (mp->flags & MMAP_FLAG_DEVICE_MEM) {
+		for (i = 0; i < (mp->size / PAGE_SIZE); i++) {
+			vm_page_t *page = address_to_page(mp->pfn_list[i]);
+			if (page) {
+				pmm_free_page(page);
+			}
+		}
+	}
 
 	uthread_map_remove(ut, mp);
 done:
@@ -477,14 +574,15 @@ static inline void mmap_lock_pair (uthread_t *source, uthread_t *target)
 	/* source can be NULL */
 	/* target cannot be NULL */
 
-	if (target < source)
+	if (target < source) {
 		mmap_lock(target);
-
-	if (source)
+	}
+	if (source) {
 		mmap_lock(source);
-
-	if (target > source)
+	}
+	if (target > source) {
 		mmap_lock(target);
+	}
 }
 
 static inline void mmap_unlock_pair (uthread_t *source, uthread_t *target)
@@ -494,14 +592,15 @@ static inline void mmap_unlock_pair (uthread_t *source, uthread_t *target)
 	/* source can be NULL */
 	/* target cannot be NULL */
 
-	if (target > source)
+	if (target > source) {
 		mmap_unlock(target);
-
-	if (source)
+	}
+	if (source) {
 		mmap_unlock(source);
-
-	if (target < source)
+	}
+	if (target < source) {
 		mmap_unlock(target);
+	}
 }
 
 status_t uthread_virt_to_phys(uthread_t *ut, vaddr_t vaddr, paddr_t *paddr)
@@ -576,18 +675,18 @@ status_t uthread_grant_pages(uthread_t *ut_target, ext_vaddr_t vaddr_src,
 			goto err_out;
 		}
 
-		if (mp_src->flags & UTM_NS_MEM)
+		if (mp_src->flags & UTM_NS_MEM) {
 			flags = flags | UTM_NS_MEM;
-
+		}
 		align = mp_src->align;
 	}
 
 	size = ROUNDUP((size + offset), PAGE_SIZE);
 
 	npages = size / PAGE_SIZE;
-	if (npages == 1)
+	if (npages == 1) {
 		flags |= UTM_PHYS_CONTIG;
-
+	}
 	*vaddr_target = uthread_find_va_space(ut_target, size, flags, align);
 	if (!(*vaddr_target)) {
 		err = ERR_NO_MEMORY;
@@ -604,9 +703,9 @@ status_t uthread_grant_pages(uthread_t *ut_target, ext_vaddr_t vaddr_src,
 	err = arch_uthread_translate_map(ut_target, vaddr_src, *vaddr_target,
 			pfn_list, npages, flags, ns_src, ns_page_list);
 
-	if (err != NO_ERROR)
+	if (err != NO_ERROR) {
 		goto err_free_pfn_list;
-
+	}
 	err = uthread_map_alloc(ut_target, NULL, *vaddr_target, pfn_list,
 			size, flags, align);
 
@@ -614,8 +713,9 @@ status_t uthread_grant_pages(uthread_t *ut_target, ext_vaddr_t vaddr_src,
 	*vaddr_target += offset;
 
 err_free_pfn_list:
-	if (pfn_list)
+	if (pfn_list) {
 		free(pfn_list);
+	}
 err_out:
 	mmap_unlock_pair(ut_src, ut_target);
 	return err;
@@ -625,9 +725,9 @@ status_t uthread_revoke_pages(uthread_t *ut, vaddr_t vaddr, size_t size)
 {
 	u_int offset = vaddr & (PAGE_SIZE - 1);
 
-	if (size == 0)
+	if (size == 0) {
 		return 0;
-
+	}
 	vaddr = ROUNDDOWN(vaddr, PAGE_SIZE);
 	size  = ROUNDUP(size + offset, PAGE_SIZE);
 

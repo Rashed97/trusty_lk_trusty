@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2015-2016, NVIDIA CORPORATION. All rights reserved.
  * Copyright (c) 2013, Google Inc. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
@@ -46,6 +47,8 @@ FUNCTION(sm_sched_nonsecure)
 	sub	sp, sp, #(4 * SMC_NUM_ARGS) /* allocate smc32_args_t on stack */
 	stp	w0, w1, [sp]
 	stp	w2, w3, [sp, #4 * 2]
+	stp	w4, w5, [sp, #4 * 4]
+	stp	w6, w7, [sp, #4 * 6]
 
 	ubfx	x0, x0, #24, #6		/* x0 = entity */
 	ldr	x9, =sm_fastcall_table
@@ -60,6 +63,8 @@ FUNCTION(sm_sched_nonsecure)
 	pop	x9, x30
 	stp	w0, w1, [x9], #8
 	stp	w2, w3, [x9], #8
+	stp	w4, w5, [x9], #8
+	stp	w6, w7, [x9], #8
 	ret
 
 .Lsm_err_not_supported:

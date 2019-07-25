@@ -37,10 +37,11 @@
 #include <lk/init.h>
 #include <string.h>
 #include <arch/ops.h>
+#include <platform/speculation_barrier.h>
 #if WITH_LIB_VERSION
 #include <version.h>
 #endif
-
+#include <platform/platform_p.h>
 #define LOCAL_TRACE	1
 
 static mutex_t smc_table_lock = MUTEX_INITIAL_VALUE(smc_table_lock);
@@ -103,12 +104,14 @@ static long smc_stdcall_secure_monitor(smc32_args_t *args)
 	u_int function = SMC_FUNCTION(args->smc_nr);
 	smc32_handler_t handler_fn = NULL;
 
-	if (function < countof(sm_stdcall_function_table))
+	if (function < countof(sm_stdcall_function_table)) {
+		/* Barrier against speculating sm_stdcall_function_table[function] */
+		platform_arch_speculation_barrier();
 		handler_fn = sm_stdcall_function_table[function];
-
-	if (!handler_fn)
+	}
+	if (!handler_fn) {
 		handler_fn = smc_undefined;
-
+	}
 	return handler_fn(args);
 }
 
@@ -124,9 +127,21 @@ static long smc_fiq_enter(smc32_args_t *args)
 }
 
 #if !WITH_LIB_SM_MONITOR
+
+/* Keep MPIDR_MAX_AFFLVL value in sync with definition in ATF */
+#define MPIDR_MAX_AFFLVL	2
+
 static long smc_cpu_suspend(smc32_args_t *args)
 {
 	lk_init_level_all(LK_INIT_FLAG_CPU_SUSPEND);
+
+	/*
+	 * If a system suspend is occuring, the last core
+	 * will suspend with the maximum affinity level.
+	 * If this is happening, trigger system suspend hooks
+	 */
+	if (args->params[0] == MPIDR_MAX_AFFLVL)
+		lk_init_level_all(LK_INIT_FLAG_SYSTEM_SUSPEND);
 
 	return 0;
 }
@@ -134,6 +149,14 @@ static long smc_cpu_suspend(smc32_args_t *args)
 static long smc_cpu_resume(smc32_args_t *args)
 {
 	lk_init_level_all(LK_INIT_FLAG_CPU_RESUME);
+
+	/*
+	 * If a system resume is occuring, the first core
+	 * will resume with the maximum affinity level.
+	 * If this is happening, trigger system resume hooks
+	 */
+	if (args->params[0] == MPIDR_MAX_AFFLVL)
+		lk_init_level_all(LK_INIT_FLAG_SYSTEM_RESUME);
 
 	return 0;
 }
@@ -145,21 +168,34 @@ static long smc_get_version_str(smc32_args_t *args)
 	int32_t index = args->params[0];
 	size_t version_len = strlen(lk_version);
 
-	if (index == -1)
+	if (index == -1) {
 		return version_len;
-
-	if ((size_t)index >= version_len)
+	}
+	if ((size_t)index >= version_len) {
 		return SM_ERR_INVALID_PARAMETERS;
-
+	}
 	return lk_version[index];
 }
 #endif
+
+#if !defined(DISABLE_NS_DRAM_RANGE_CHECK)
+static long smc_register_ns_dram_ranges(smc32_args_t *args)
+{
+	if (!args)
+		return ERR_INVALID_ARGS;
+
+	ns_addr_t ns_base =  ((uint64_t)args->params[1] << 32) | args->params[0];
+
+	return platform_register_ns_dram_ranges(ns_base, args->params[2]);
+}
+#endif /* !defined(DISABLE_NS_DRAM_RANGE_CHECK) */
 
 smc32_handler_t sm_fastcall_function_table[] = {
 	[SMC_FUNCTION(SMC_FC_REQUEST_FIQ)] = smc_intc_request_fiq,
 	[SMC_FUNCTION(SMC_FC_FIQ_EXIT)] = smc_fiq_exit,
 	[SMC_FUNCTION(SMC_FC_GET_NEXT_IRQ)] = smc_intc_get_next_irq,
 	[SMC_FUNCTION(SMC_FC_FIQ_ENTER)] = smc_fiq_enter,
+	[SMC_FUNCTION(SMC_FC_HV_SHARE_GUEST_INFO)] = smc_hv_init,
 #if !WITH_LIB_SM_MONITOR
 	[SMC_FUNCTION(SMC_FC_CPU_SUSPEND)] = smc_cpu_suspend,
 	[SMC_FUNCTION(SMC_FC_CPU_RESUME)] = smc_cpu_resume,
@@ -168,6 +204,9 @@ smc32_handler_t sm_fastcall_function_table[] = {
 	[SMC_FUNCTION(SMC_FC_GET_VERSION_STR)] = smc_get_version_str,
 #endif
 	[SMC_FUNCTION(SMC_FC_API_VERSION)] = smc_sm_api_version,
+#if !defined(DISABLE_NS_DRAM_RANGE_CHECK)
+	[SMC_FUNCTION(SMC_FC_REGISTER_NS_DRAM_RANGES)] = smc_register_ns_dram_ranges,
+#endif
 };
 
 uint32_t sm_nr_fastcall_functions = countof(sm_fastcall_function_table);
@@ -194,17 +233,18 @@ status_t sm_register_entity(uint entity_nr, smc32_entity_t *entity)
 {
 	status_t err = NO_ERROR;
 
-	if (entity_nr >= SMC_NUM_ENTITIES)
+	if (entity_nr >= SMC_NUM_ENTITIES) {
 		return ERR_INVALID_ARGS;
-
-	if (entity_nr >= SMC_ENTITY_RESERVED && entity_nr < SMC_ENTITY_TRUSTED_APP)
+	}
+	if (entity_nr >= SMC_ENTITY_RESERVED && entity_nr < SMC_ENTITY_TRUSTED_APP) {
 		return ERR_NOT_ALLOWED;
-
-	if (!entity)
+	}
+	if (!entity) {
 		return ERR_INVALID_ARGS;
-
-	if (!entity->fastcall_handler && !entity->stdcall_handler)
+	}
+	if (!entity->fastcall_handler && !entity->stdcall_handler){
 		return ERR_NOT_VALID;
+	}
 
 	mutex_acquire(&smc_table_lock);
 
@@ -216,14 +256,15 @@ status_t sm_register_entity(uint entity_nr, smc32_entity_t *entity)
 		goto unlock;
 	}
 
-	if (entity->fastcall_handler)
+	if (entity->fastcall_handler) {
 		sm_fastcall_table[entity_nr] = entity->fastcall_handler;
-
-	if (entity->nopcall_handler)
+	}
+	if (entity->nopcall_handler) {
 		sm_nopcall_table[entity_nr] = entity->nopcall_handler;
-
-	if (entity->stdcall_handler)
+	}
+	if (entity->stdcall_handler) {
 		sm_stdcall_table[entity_nr] = entity->stdcall_handler;
+	}
 unlock:
 	mutex_release(&smc_table_lock);
 	return err;

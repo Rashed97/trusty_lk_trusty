@@ -74,6 +74,7 @@ struct ql_tipc_dev {
 	ns_size_t ns_sz;
 	ns_addr_t ns_pa;
 	void     *ns_va;
+	uint32_t  guest;
 	const uuid_t *uuid;
 
 	unsigned long inuse[BITMAP_NUM_WORDS(QL_TIPC_ADDR_MAX_NUM)];
@@ -209,6 +210,9 @@ static long dev_create(ns_addr_t buf_pa, ns_size_t buf_sz, uint buf_mmu_flags)
 
 	dev->uuid = &zero_uuid;
 
+	/* TODO: accept guest argument to support hypervisor use case */
+	dev->guest = 0;
+
 	list_clear_node(&dev->node);
 	handle_list_init(&dev->handle_list);
 
@@ -301,7 +305,7 @@ static int dev_connect(struct ql_tipc_dev *dev, void *ns_payload,
 	req.body[ns_payload_len - sizeof(req.hdr)] = 0;
 
 	/* open ipc channel */
-	rc = ipc_port_connect_async(dev->uuid, (const char *)req.body,
+	rc = ipc_port_connect_async(dev->guest, dev->uuid, (const char *)req.body,
 				    ns_payload_len - sizeof(req.hdr), 0, &chan);
 	if (rc != NO_ERROR) {
 		LTRACEF("failed to open ipc channel: %d\n", rc);
@@ -534,7 +538,7 @@ long ql_tipc_handle_cmd(ns_addr_t buf_pa, ns_size_t cmd_sz)
 
 	/* check for minimum size */
 	if (cmd_sz < sizeof(cmd_hdr)) {
-		LTRACEF("message is too short (%zd)\n", cmd_sz);
+		LTRACEF("message is too short (%zd)\n", (ssize_t)cmd_sz);
 		return SM_ERR_INVALID_PARAMETERS;
 	}
 

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2014-2015, Google, Inc. All rights reserved
+ * Copyright (c) 2017, NVIDIA Corporation. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -95,10 +96,11 @@ static const struct tipc_vdev_descr _nm = {                          \
 
 
 /*
- *  Create TIPC device and register it witth virtio subsystem
+ *  Create TIPC device per NS guest and register it with virtio subsystem
  */
-status_t create_tipc_device(const struct tipc_vdev_descr *descr, size_t descr_sz,
-                            const uuid_t *uuid, struct tipc_dev **dev_ptr);
+status_t create_tipc_device(const struct tipc_vdev_descr *descr,
+			    size_t descr_sz, const uuid_t *uuid,
+			    uint32_t guest_id, struct tipc_dev **dev_ptr);
 
 
 /*

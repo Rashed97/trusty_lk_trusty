@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2013, Google, Inc. All rights reserved
- * Copyright (c) 2013, NVIDIA CORPORATION. All rights reserved
+ * Copyright (c) 2013-2018, NVIDIA CORPORATION. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -31,34 +31,38 @@
 #include <stdlib.h>
 #include <string.h>
 #include <trace.h>
-
-#include <platform.h>
 #include <uthread.h>
+
 #include <lib/trusty/sys_fd.h>
 #include <lib/trusty/trusty_app.h>
+#include <trusty_std.h>
 
 #define LOCAL_TRACE 0
 
 static int32_t sys_std_write(uint32_t fd, user_addr_t user_ptr, uint32_t size);
+uint32_t uctx_get_current_guest(void);
+int32_t sys_std_platform_ioctl(uint32_t fd, uint32_t cmd, user_addr_t user_ptr);
 
 static mutex_t fd_lock = MUTEX_INITIAL_VALUE(fd_lock);
 
 static const struct sys_fd_ops sys_std_fd_op = {
 	.write = sys_std_write,
+	.ioctl = sys_std_platform_ioctl,
 };
 
 static struct sys_fd_ops const *sys_fds[MAX_SYS_FD_HADLERS] = {
 	[1] = &sys_std_fd_op,  /* stdout */
 	[2] = &sys_std_fd_op,  /* stderr */
+	[3] = &sys_std_fd_op,  /* std_ioctol */
 };
 
 status_t install_sys_fd_handler(uint32_t fd, const struct sys_fd_ops *ops)
 {
 	status_t ret;
 
-	if (fd >= countof(sys_fds))
+	if (fd >= countof(sys_fds)) {
 		return ERR_INVALID_ARGS;
-
+	}
 	mutex_acquire(&fd_lock);
 	if (!sys_fds[fd]) {
 		sys_fds[fd] = ops;
@@ -72,13 +76,13 @@ status_t install_sys_fd_handler(uint32_t fd, const struct sys_fd_ops *ops)
 
 static const struct sys_fd_ops *get_sys_fd_handler(uint32_t fd)
 {
-	if (fd >= countof(sys_fds))
+	if (fd >= countof(sys_fds)) {
 		return NULL;
-
+	}
 	return sys_fds[fd];
 }
 
-static bool valid_address(vaddr_t addr, u_int size)
+static bool valid_address(vaddr_t addr, size_t size)
 {
 	return uthread_is_valid_range(uthread_get_current(), addr, size);
 }
@@ -87,10 +91,12 @@ static bool valid_address(vaddr_t addr, u_int size)
 static int32_t sys_std_write(uint32_t fd, user_addr_t user_ptr, uint32_t size)
 {
 	/* check buffer is in task's address space */
-	if (!valid_address((vaddr_t)user_ptr, size))
+	if (!valid_address((vaddr_t)user_ptr, size)) {
 		return ERR_INVALID_ARGS;
+	}
+	/* always send out error logs */
+	dwrite((fd == 2) ? ALWAYS : INFO, (const void *)(uintptr_t)user_ptr, size);
 
-	dwrite((fd == 2) ? INFO : SPEW, (const void *)(uintptr_t)user_ptr, size);
 	return size;
 }
 
@@ -98,9 +104,9 @@ long sys_write(uint32_t fd, user_addr_t user_ptr, uint32_t size)
 {
 	const struct sys_fd_ops *ops = get_sys_fd_handler(fd);
 
-	if (ops && ops->write)
+	if (ops && ops->write) {
 		return ops->write(fd, user_ptr, size);
-
+	}
 	return ERR_NOT_SUPPORTED;
 }
 
@@ -128,9 +134,9 @@ long sys_read(uint32_t fd, user_addr_t user_ptr, uint32_t size)
 {
 	const struct sys_fd_ops *ops = get_sys_fd_handler(fd);
 
-	if (ops && ops->read)
+	if (ops && ops->read) {
 		return ops->read(fd, user_ptr, size);
-
+	}
 	return ERR_NOT_SUPPORTED;
 }
 
@@ -138,9 +144,9 @@ long sys_ioctl(uint32_t fd, uint32_t req, user_addr_t user_ptr)
 {
 	const struct sys_fd_ops *ops = get_sys_fd_handler(fd);
 
-	if (ops && ops->ioctl)
+	if (ops && ops->ioctl) {
 		return ops->ioctl(fd, req, user_ptr);
-
+	}
 	return ERR_NOT_SUPPORTED;
 }
 
@@ -160,7 +166,7 @@ long sys_gettime(uint32_t clock_id, uint32_t flags, user_addr_t time)
 	// return time in nanoseconds
 	lk_bigtime_t t = current_time_hires() * 1000;
 
-	return copy_to_user(time, &t, sizeof(int64_t));
+	return copy_to_user(time, &t, sizeof(uint64_t));
 }
 
 long sys_mmap(user_addr_t uaddr, uint32_t size, uint32_t flags, uint32_t handle)
@@ -170,17 +176,28 @@ long sys_mmap(user_addr_t uaddr, uint32_t size, uint32_t flags, uint32_t handle)
 	long ret;
 
 	/*
+	 * Allocate and map memory with Device attributes
+	 */
+	if (flags & MMAP_FLAG_DEVICE_MEM) {
+		ret = uthread_pmm_alloc_and_map(trusty_app->ut, &vaddr, size,
+				flags, 1);
+		if (ret)
+			return ret;
+		return vaddr;
+	}
+
+	/*
 	 * Only allows mapping on IO region specified by handle (id) and uaddr
 	 * must be 0 for now.
 	 * TBD: Add support in uthread_map to use uaddr as a hint.
 	 */
-	if (flags != MMAP_FLAG_IO_HANDLE || uaddr != 0)
+	if (flags != MMAP_FLAG_IO_HANDLE || uaddr != 0) {
 		return ERR_INVALID_ARGS;
-
+	}
 	ret = trusty_app_setup_mmio(trusty_app, handle, &vaddr, size);
-	if (ret != NO_ERROR)
+	if (ret != NO_ERROR) {
 		return ret;
-
+	}
 	return vaddr;
 }
 
@@ -209,22 +226,22 @@ long sys_prepare_dma(user_addr_t uaddr, uint32_t size, uint32_t flags,
 	LTRACEF("uaddr 0x%x, size 0x%x, flags 0x%x, pmem 0x%x\n",
 	        uaddr, size, flags, pmem);
 
-	if (size == 0 || !valid_address((vaddr_t)uaddr, size))
+	if (size == 0 || !valid_address((vaddr_t)uaddr, size)) {
 		return ERR_INVALID_ARGS;
-
+	}
 	do {
 		ret = uthread_virt_to_phys(current,
-				(vaddr_t)uaddr + mapped_size, &kpmem.paddr);
-		if (ret != NO_ERROR)
+				(vaddr_t)uaddr + mapped_size, (paddr_t *)&kpmem.paddr);
+		if (ret != NO_ERROR) {
 			return ret;
-
+		}
 		kpmem.size = MIN(size - mapped_size,
 			PAGE_SIZE - (kpmem.paddr & (PAGE_SIZE - 1)));
 
 		ret = copy_to_user(pmem, &kpmem, sizeof(struct dma_pmem));
-		if (ret != NO_ERROR)
+		if (ret != NO_ERROR) {
 			return ret;
-
+		}
 		pmem += sizeof(struct dma_pmem);
 
 		mapped_size += kpmem.size;
@@ -232,14 +249,14 @@ long sys_prepare_dma(user_addr_t uaddr, uint32_t size, uint32_t flags,
 
 	} while (mapped_size < size && (flags & DMA_FLAG_MULTI_PMEM));
 
-	if (flags & DMA_FLAG_FROM_DEVICE)
+	if (flags & DMA_FLAG_FROM_DEVICE) {
 		arch_clean_invalidate_cache_range(uaddr, mapped_size);
-	else
+	} else {
 		arch_clean_cache_range(uaddr, mapped_size);
-
-	if (!(flags & DMA_FLAG_ALLOW_PARTIAL) && mapped_size != size)
+	}
+	if (!(flags & DMA_FLAG_ALLOW_PARTIAL) && mapped_size != size) {
 		return ERR_BAD_LEN;
-
+	}
 	return entries;
 }
 
@@ -248,12 +265,12 @@ long sys_finish_dma(user_addr_t uaddr, uint32_t size, uint32_t flags)
 	LTRACEF("uaddr 0x%x, size 0x%x, flags 0x%x\n", uaddr, size, flags);
 
 	/* check buffer is in task's address space */
-	if (!valid_address((vaddr_t)uaddr, size))
+	if (!valid_address((vaddr_t)uaddr, size)) {
 		return ERR_INVALID_ARGS;
-
-	if (flags & DMA_FLAG_FROM_DEVICE)
+	}
+	if (flags & DMA_FLAG_FROM_DEVICE) {
 		arch_clean_invalidate_cache_range(uaddr, size);
-
+	}
 	return NO_ERROR;
 }
 

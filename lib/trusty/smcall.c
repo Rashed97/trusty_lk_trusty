@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2013-2016, Google, Inc. All rights reserved
+ * Copyright (c) 2017-2019, NVIDIA CORPORATION. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -25,13 +26,17 @@
 #include <assert.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/types.h>
 #include <trace.h>
 #include <lk/init.h>
 #include <arch/mmu.h>
 #include <lib/sm.h>
 #include <lib/sm/smcall.h>
+#include <kernel/vm.h>
+#include <lib/trusty/trusty_guest_ctx.h>
 #include <lib/sm/sm_err.h>
+#include <dev/interrupt/arm_gic.h>
 
 #include "tipc_dev_ql.h"
 #include "trusty_virtio.h"
@@ -72,14 +77,36 @@ static status_t get_ns_mem_buf(struct smc32_args *args,
 	return NO_ERROR;
 }
 
-/*
- * Translate intermal errors to SMC errors
- */
-static long to_smc_error(long err)
+__WEAK long lock_bl_data_interface(void)
 {
-	if (err >= 0)
-		return err;
+	return NO_ERROR;
+}
 
+__WEAK long handle_bl_data_interface(long data_type, paddr_t addr, size_t size)
+{
+	(void) data_type;
+	(void) addr;
+	(void) size;
+
+	return NO_ERROR;
+}
+
+__WEAK long set_root_of_trust_params(paddr_t addr, size_t size)
+{
+	(void) addr;
+	(void) size;
+
+	return NO_ERROR;
+}
+
+/*
+ * Translate internal errors to SMC errors
+ */
+long to_smc_error(long err)
+{
+	if (err >= 0) {
+		return err;
+	}
 	switch (err) {
 	case ERR_INVALID_ARGS:
 		return SM_ERR_INVALID_PARAMETERS;
@@ -95,6 +122,13 @@ static long to_smc_error(long err)
 	}
 }
 
+__WEAK long smc_hv_init(smc32_args_t *args)
+{
+	(void)args;
+
+	return to_smc_error(NO_ERROR);
+}
+
 /*
  *  Handle standard Trusted OS SMC call function
  */
@@ -104,39 +138,73 @@ static long trusty_sm_stdcall(smc32_args_t *args)
 	ns_size_t ns_sz;
 	ns_paddr_t ns_pa;
 	uint ns_mmu_flags;
+	uint32_t guest = args->params[SMC_ARGS_GUESTID];
 
-	LTRACEF("Trusty SM service func %u args 0x%x 0x%x 0x%x\n",
+	LTRACEF("Trusty SM service func %u args 0x%x 0x%x 0x%x %x\n",
 		SMC_FUNCTION(args->smc_nr),
 		args->params[0],
 		args->params[1],
-		args->params[2]);
+		args->params[2],
+		guest);
+
+	 if (((int32_t)guest != HV_GUEST_ID) &&
+		(guest >= MAX_NUM_SUPPORTED_GUESTS)) {
+		TRACEF("%s: Error. Unexpected guestID %u\n",
+			__func__, guest);
+		return SM_ERR_INVALID_PARAMETERS;
+	}
 
 	switch (args->smc_nr) {
 
 	case SMC_SC_VIRTIO_GET_DESCR:
 		res = get_ns_mem_buf(args, &ns_pa, &ns_sz, &ns_mmu_flags);
-		if (res == NO_ERROR)
-			res = virtio_get_description(ns_pa, ns_sz, ns_mmu_flags);
+		if (res == NO_ERROR) {
+			res = virtio_get_description(ns_pa, ns_sz,
+						     ns_mmu_flags, guest);
+		}
 		break;
 
 	case SMC_SC_VIRTIO_START:
 		res = get_ns_mem_buf(args, &ns_pa, &ns_sz, &ns_mmu_flags);
-		if (res == NO_ERROR)
-			res = virtio_start(ns_pa, ns_sz, ns_mmu_flags);
+		if (res == NO_ERROR) {
+			res = virtio_start(ns_pa, ns_sz, ns_mmu_flags, guest);
+		}
 		break;
 
 	case SMC_SC_VIRTIO_STOP:
 		res = get_ns_mem_buf(args, &ns_pa, &ns_sz, &ns_mmu_flags);
-		if (res == NO_ERROR)
-			res = virtio_stop(ns_pa, ns_sz, ns_mmu_flags);
+		if (res == NO_ERROR) {
+			res = virtio_stop(ns_pa, ns_sz, ns_mmu_flags, guest);
+		}
 		break;
 
 	case SMC_SC_VDEV_RESET:
-		res = virtio_device_reset(args->params[0]);
+		res = virtio_device_reset(args->params[0], guest);
 		break;
 
 	case SMC_SC_VDEV_KICK_VQ:
-		res = virtio_kick_vq(args->params[0], args->params[1]);
+		res = virtio_kick_vq(args->params[0], args->params[1], guest);
+		break;
+
+	/**
+	 * This SMC ensures that parameters that were not set by the BL stay
+	 * inaccessible to the kernel. It is an additional layer of security
+	 * for sensitive parameters against BL bugs, version mismatches, or
+	 * rollback attacks.
+	 */
+	case SMC_SC_BL_LOCK_TOS_DATA:
+		res = lock_bl_data_interface();
+		break;
+
+	case SMC_SC_BL_SEND_TOS_DATA:
+		res = handle_bl_data_interface((long)args->params[0],
+						(paddr_t)args->params[1],
+						(size_t)args->params[2]);
+		break;
+
+	case SMC_SC_SET_ROOT_OF_TRUST:
+		res = set_root_of_trust_params((paddr_t)args->params[0],
+						(uint)args->params[1]);
 		break;
 
 	case SMC_SC_CREATE_QL_TIPC_DEV:
@@ -172,16 +240,29 @@ static long trusty_sm_stdcall(smc32_args_t *args)
 static long trusty_sm_nopcall(smc32_args_t *args)
 {
 	long res;
+	uint32_t guest = args->params[SMC_ARGS_GUESTID];
 
-	LTRACEF("Trusty SM service func %u args 0x%x 0x%x 0x%x\n",
+	LTRACEF("Trusty SM service func %u args 0x%x 0x%x 0x%x %x\n",
 		SMC_FUNCTION(args->smc_nr),
 		args->params[0],
 		args->params[1],
-		args->params[2]);
+		args->params[2],
+		guest);
+
+	if (((int32_t)guest != HV_GUEST_ID) &&
+		(guest >= MAX_NUM_SUPPORTED_GUESTS)) {
+		TRACEF("%s: Error. Unexpected guestID %u\n",
+			__func__, guest);
+		return SM_ERR_INVALID_PARAMETERS;
+	}
 
 	switch (args->params[0]) {
 	case SMC_NC_VDEV_KICK_VQ:
-		res = virtio_kick_vq(args->params[1], args->params[2]);
+		res = virtio_kick_vq(args->params[1], args->params[2], guest);
+		break;
+
+	case SMC_NC_SIM_HANDLE_IRQ:
+		res = arm_gic_sim_irq_handler(args->params[1]);
 		break;
 
 	default:

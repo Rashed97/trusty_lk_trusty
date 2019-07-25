@@ -50,6 +50,9 @@ typedef struct smc32_entity {
 	smc32_handler_t stdcall_handler;
 } smc32_entity_t;
 
+/* HV init and share guests context */
+long smc_hv_init(smc32_args_t *args);
+
 /* Schedule Secure OS */
 long sm_sched_secure(smc32_args_t *args);
 
@@ -81,6 +84,9 @@ status_t sm_register_entity(uint entity_nr, smc32_entity_t *entity);
 /* Helper function to get NS memory buffer info out of smc32 call params */
 status_t smc32_decode_mem_buf_info(struct smc32_args *args, ns_addr_t *ppa,
                                    ns_size_t *psz, uint *pmmu);
+
+/* Translate internal errors to SMC errors */
+long to_smc_error(long err);
 
 #endif /* __SM_H */
 

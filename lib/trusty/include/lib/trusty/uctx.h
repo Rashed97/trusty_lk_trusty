@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2013, Google, Inc. All rights reserved
+ * Copyright (c) 2017, NVIDIA Corporation. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -43,5 +44,6 @@ uctx_t *current_uctx(void);
 int uctx_handle_install(uctx_t *ctx, handle_t *handle, handle_id_t *id);
 int uctx_handle_remove(uctx_t *ctx, handle_id_t handle_id, handle_t **handle_ptr);
 int uctx_handle_get(uctx_t *ctx, handle_id_t handle_id, handle_t **handle_ptr);
+uint32_t uctx_get_current_guest(void);
 
 #endif

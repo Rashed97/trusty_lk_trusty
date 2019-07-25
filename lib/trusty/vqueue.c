@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2013-2014, Google, Inc. All rights reserved
+ * Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -33,6 +34,7 @@
 #include <arch/arch_ops.h>
 
 #include <lib/trusty/uio.h>
+#include <lib/trusty/hyp.h>
 
 #include <virtio/virtio_ring.h>
 #include "vqueue.h"
@@ -43,16 +45,26 @@
 
 int vqueue_init(struct vqueue *vq, uint32_t id,
 		paddr_t paddr, uint num, ulong align,
-		void *priv, vqueue_cb_t notify_cb, vqueue_cb_t kick_cb)
+		void *priv, vqueue_cb_t notify_cb, vqueue_cb_t kick_cb,
+		uint32_t guest)
 {
 	status_t ret;
 	void   *vptr = NULL;
+	size_t roundedup_vring_sz;
 
 	DEBUG_ASSERT(vq);
 
 	vq->vring_sz = vring_size(num, align);
+	roundedup_vring_sz = ROUNDUP(vq->vring_sz, PAGE_SIZE);
+	ret = trusty_hyp_check_guest_pa_valid(paddr, roundedup_vring_sz, guest);
+	if (ret != NO_ERROR) {
+		TRACEF("%s: check_guest_pa_valid failed, error = %d",
+			__func__, ret);
+		return ret;
+	}
+
 	ret = vmm_alloc_physical(vmm_get_kernel_aspace(), "vqueue",
-	                         ROUNDUP(vq->vring_sz, PAGE_SIZE),
+	                         roundedup_vring_sz,
 	                         &vptr,  PAGE_SIZE_SHIFT,
 	                         paddr, 0,
 	                         ARCH_MMU_FLAG_NS | ARCH_MMU_FLAG_PERM_NO_EXECUTE |
@@ -86,6 +98,7 @@ void vqueue_destroy(struct vqueue *vq)
 	vring_addr = vq->vring_addr;
 	vq->vring_addr = (vaddr_t)NULL;
 	vq->vring_sz = 0;
+	vq->last_avail_idx = 0;
 	spin_unlock_restore(&vq->slock, state, VQ_LOCK_FLAGS);
 
 	vmm_free_region(vmm_get_kernel_aspace(), vring_addr);
@@ -96,8 +109,9 @@ void vqueue_signal_avail(struct vqueue *vq)
 	spin_lock_saved_state_t state;
 
 	spin_lock_save(&vq->slock, &state, VQ_LOCK_FLAGS);
-	if (vq->vring_addr)
+	if (vq->vring_addr) {
 		vq->vring.used->flags |= VRING_USED_F_NO_NOTIFY;
+	}
 	event_signal(&vq->avail_event, false);
 	spin_unlock_restore(&vq->slock, state, VQ_LOCK_FLAGS);
 }
@@ -175,11 +189,11 @@ static int _vqueue_get_avail_buf_locked(struct vqueue *vq,
 		}
 
 		desc = &vq->vring.desc[next_idx];
-		if (desc->flags & VRING_DESC_F_WRITE)
+		if (desc->flags & VRING_DESC_F_WRITE) {
 			iovlist = &iovbuf->out_iovs;
-		else
+		} else {
 			iovlist = &iovbuf->in_iovs;
-
+		}
 		if (iovlist->used < iovlist->cnt) {
 			/* .base will be set when we map this iov */
 			iovlist->iovs[iovlist->used].len = desc->len;
@@ -208,10 +222,11 @@ int vqueue_get_avail_buf(struct vqueue *vq, struct vqueue_buf *iovbuf)
 	return ret;
 }
 
-int vqueue_map_iovs(struct vqueue_iovs *vqiovs, u_int flags)
+int vqueue_map_iovs(struct vqueue_iovs *vqiovs, u_int flags, uint32_t guest)
 {
 	uint  i;
 	int ret;
+	size_t roundedup_iovs_sz;
 
 	DEBUG_ASSERT(vqiovs);
 	DEBUG_ASSERT(vqiovs->phys);
@@ -219,13 +234,22 @@ int vqueue_map_iovs(struct vqueue_iovs *vqiovs, u_int flags)
 	DEBUG_ASSERT(vqiovs->used <= vqiovs->cnt);
 
 	for (i = 0; i < vqiovs->used; i++) {
+		roundedup_iovs_sz = ROUNDUP(vqiovs->iovs[i].len, PAGE_SIZE);
+		ret = trusty_hyp_check_guest_pa_valid(vqiovs->phys[i],
+				roundedup_iovs_sz, guest);
+		if (ret != NO_ERROR) {
+			TRACEF("%s: check_guest_pa_valid failed, error = %d",
+				__func__, ret);
+			return ret;
+		}
         vqiovs->iovs[i].base = NULL;
 		ret = vmm_alloc_physical(vmm_get_kernel_aspace(), "vqueue",
-		                         ROUNDUP(vqiovs->iovs[i].len, PAGE_SIZE),
+		                         roundedup_iovs_sz,
 		                         &vqiovs->iovs[i].base, PAGE_SIZE_SHIFT,
 		                         vqiovs->phys[i], 0, flags);
-		if (ret)
+		if (ret) {
 			goto err;
+		}
 	}
 
 	return NO_ERROR;

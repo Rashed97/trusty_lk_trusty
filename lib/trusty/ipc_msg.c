@@ -47,6 +47,7 @@
 #include <sys/types.h>
 #include <trace.h>
 #include <uthread.h>
+#include <platform/speculation_barrier.h>
 
 #include <lib/syscall.h>
 
@@ -180,26 +181,32 @@ static inline uint8_t *msg_queue_get_buf(ipc_msg_queue_t *mq, msg_item_t *item)
 
 static inline msg_item_t *msg_queue_get_item(ipc_msg_queue_t *mq, uint32_t id)
 {
-	return id < mq->num_items ? &mq->items[id] : NULL;
+	if (id < mq->num_items) {
+		/* Barrier against speculating items[id] */
+		platform_arch_speculation_barrier();
+		return &mq->items[id];
+	} else {
+		return NULL;
+	}
 }
 
 static int check_channel_locked(handle_t *chandle)
 {
-	if (unlikely(!chandle))
+	if (unlikely(!chandle)) {
 		return ERR_INVALID_ARGS;
-
-	if (unlikely(!ipc_is_channel(chandle)))
+	}
+	if (unlikely(!ipc_is_channel(chandle))) {
 		return ERR_INVALID_ARGS;
-
+	}
 	return NO_ERROR;
 }
 
 static int check_channel_connected_locked(handle_t *chandle)
 {
 	int ret = check_channel_locked(chandle);
-	if (unlikely(ret != NO_ERROR))
+	if (unlikely(ret != NO_ERROR)) {
 		return ret;
-
+	}
 	ipc_chan_t *chan = containerof(chandle, ipc_chan_t, handle);
 
 	if (likely(chan->state == IPC_CHAN_STATE_CONNECTED)) {
@@ -207,10 +214,11 @@ static int check_channel_connected_locked(handle_t *chandle)
 		return NO_ERROR;
 	}
 
-	if (likely(chan->state == IPC_CHAN_STATE_DISCONNECTING))
+	if (likely(chan->state == IPC_CHAN_STATE_DISCONNECTING)) {
 		return ERR_CHANNEL_CLOSED;
-	else
+	} else {
 		return ERR_NOT_READY;
+	}
 }
 
 static int msg_write_locked(ipc_chan_t *chan, msg_desc_t *msg)
@@ -252,9 +260,9 @@ static int msg_write_locked(ipc_chan_t *chan, msg_desc_t *msg)
 		return ERR_INVALID_ARGS;
 	}
 
-	if (ret < 0)
+	if (ret < 0) {
 		return ret;
-
+	}
 	item->len = (size_t) ret;
 	list_delete(&item->node);
 	list_add_tail(&mq->filled_list, &item->node);
@@ -328,9 +336,9 @@ static int msg_peek_next_filled_locked(ipc_msg_queue_t *mq, ipc_msg_info_t *info
 	msg_item_t *item;
 
 	item = list_peek_head_type(&mq->filled_list, msg_item_t, node);
-	if (!item)
+	if (!item) {
 		return ERR_NO_MSG;
-
+	}
 	info->len = item->len;
 	info->id  = item->id;
 
@@ -361,9 +369,9 @@ static int msg_put_read_locked(ipc_chan_t *chan, uint32_t msg_id)
 	ipc_msg_queue_t *mq = chan->msg_queue;
 	msg_item_t *item = msg_queue_get_item(mq, msg_id);
 
-	if (!item || item->state != MSG_ITEM_STATE_READ)
+	if (!item || item->state != MSG_ITEM_STATE_READ) {
 		return ERR_INVALID_ARGS;
-
+	}
 	list_delete(&item->node);
 
 	/* put it on the head since it was just taken off here */
@@ -390,14 +398,14 @@ long __SYSCALL sys_send_msg(uint32_t handle_id, user_addr_t user_msg)
 	/* copy message descriptor from user space */
 	tmp_msg.type = IPC_MSG_BUFFER_USER;
 	ret = copy_from_user(&tmp_msg.user, user_msg, sizeof(ipc_msg_user_t));
-	if (unlikely(ret != NO_ERROR))
+	if (unlikely(ret != NO_ERROR)) {
 		return (long) ret;
-
+	}
 	/* grab handle */
 	ret = uctx_handle_get(current_uctx(), handle_id, &chandle);
-	if (unlikely(ret != NO_ERROR))
+	if (unlikely(ret != NO_ERROR)) {
 		return (long) ret;
-
+	}
 	mutex_acquire(&ipc_lock);
 	/* check if it is  avalid channel to call send_msg */
 	ret = check_channel_connected_locked(chandle);
@@ -420,9 +428,9 @@ int ipc_send_msg(handle_t *chandle, ipc_msg_kern_t *msg)
 	int ret;
 	msg_desc_t tmp_msg;
 
-	if (!msg)
+	if (!msg) {
 		return ERR_INVALID_ARGS;
-
+	}
 	tmp_msg.type = IPC_MSG_BUFFER_KERNEL;
 	memcpy(&tmp_msg.kern, msg, sizeof(ipc_msg_kern_t));
 
@@ -447,9 +455,9 @@ long __SYSCALL sys_get_msg(uint32_t handle_id, user_addr_t user_msg_info)
 
 	/* grab handle */
 	ret = uctx_handle_get(current_uctx(), handle_id, &chandle);
-	if (ret != NO_ERROR)
+	if (ret != NO_ERROR) {
 		return (long) ret;
-
+	}
 	mutex_acquire(&ipc_lock);
 	/* check if channel handle is a valid one */
 	ret = check_channel_locked(chandle);
@@ -499,9 +507,9 @@ long __SYSCALL sys_put_msg(uint32_t handle_id, uint32_t msg_id)
 
 	/* grab handle */
 	int ret = uctx_handle_get(current_uctx(), handle_id, &chandle);
-	if (unlikely(ret != NO_ERROR))
+	if (unlikely(ret != NO_ERROR)) {
 		return (long) ret;
-
+	}
 	/* and put it to rest */
 	ret = ipc_put_msg(chandle, msg_id);
 	handle_decref(chandle);
@@ -536,14 +544,14 @@ long __SYSCALL sys_read_msg(uint32_t handle_id, uint32_t msg_id, uint32_t offset
 	/* get msg descriptor form user space */
 	tmp_msg.type = IPC_MSG_BUFFER_USER;
 	ret = copy_from_user(&tmp_msg.user, user_msg, sizeof(ipc_msg_user_t));
-	if (unlikely(ret != NO_ERROR))
+	if (unlikely(ret != NO_ERROR)) {
 		return (long) ret;
-
+	}
 	/* grab handle */
 	ret = uctx_handle_get(current_uctx(), handle_id, &chandle);
-	if (unlikely(ret != NO_ERROR))
+	if (unlikely(ret != NO_ERROR)) {
 		return (long) ret;
-
+	}
 	mutex_acquire(&ipc_lock);
 	/* check if channel handle is a valid one */
 	ret = check_channel_locked (chandle);
@@ -565,9 +573,9 @@ int ipc_read_msg(handle_t *chandle, uint32_t msg_id, uint32_t offset,
 	int ret;
 	msg_desc_t tmp_msg;
 
-	if (!msg)
+	if (!msg) {
 		return ERR_INVALID_ARGS;
-
+	}
 	tmp_msg.type = IPC_MSG_BUFFER_KERNEL;
 	memcpy(&tmp_msg.kern, msg, sizeof(ipc_msg_kern_t));
 

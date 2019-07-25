@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2013, NVIDIA CORPORATION. All rights reserved
+ * Copyright (c) 2012-2016, NVIDIA CORPORATION. All rights reserved.
  * Copyright (c) 2013, Google, Inc. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
@@ -39,6 +39,7 @@
 typedef struct
 {
 	uuid_t		uuid;
+	uint32_t	vmid;
 	uint32_t	min_stack_size;
 	uint32_t	min_heap_size;
 	uint32_t	map_io_mem_cnt;
@@ -67,7 +68,7 @@ typedef struct trusty_app
 void trusty_app_init(void);
 status_t trusty_app_setup_mmio(trusty_app_t *trusty_app,
 		u_int mmio_id, vaddr_t *vaddr, uint32_t size);
-trusty_app_t *trusty_app_find_by_uuid(uuid_t *uuid);
+trusty_app_t *trusty_app_find_by_uuid(uuid_t *uuid, uint32_t vmid);
 void trusty_app_forall(void (*fn)(trusty_app_t *ta, void *data), void *data);
 
 typedef struct trusty_app_notifier

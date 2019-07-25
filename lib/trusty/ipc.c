@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2013, Google, Inc. All rights reserved
+ * Copyright (c) 2017, NVIDIA Corporation. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -46,6 +47,8 @@
 #include <lib/trusty/trusty_app.h>
 #include <lib/trusty/uctx.h>
 #include <lib/trusty/tipc_dev.h>
+#include <lib/trusty/hyp.h>
+#include <lib/trusty/trusty_guest_ctx.h>
 
 #include <reflist.h>
 
@@ -259,9 +262,9 @@ int ipc_port_publish(handle_t *phandle)
 		obj_ref_t tmp_client_ref = OBJ_REF_INITIAL_VALUE(tmp_client_ref);
 		list_for_every_entry_safe(&waiting_for_port_chan_list, client, temp, ipc_chan_t, node) {
 
-			if (strcmp(client->path, port->path))
+			if (strcmp(client->path, port->path)) {
 				continue;
-
+			}
 			free((void *)client->path);
 			client->path = NULL;
 
@@ -270,12 +273,23 @@ int ipc_port_publish(handle_t *phandle)
 			list_delete(&client->node);
 			chan_del_ref(client, &client->node_ref); /* drop list ref */
 
-			/* try to attach port */
-			int err = port_attach_client(port, client);
-			if (err) {
-				/* failed to attach port: close channel */
-				LTRACEF("failed (%d) to attach_port\n", err);
-				chan_shutdown_locked(client);
+			/*
+			 * For the client that was waiting for the port to come online, make sure
+			 * its TA permission list is checked before allowing it to attach to the
+			 * port.
+			 */
+			ret = trusty_hyp_check_guest_access(client->handle.guest_id, port->uuid);
+			if (ret) {
+				TRACEF("guest %u access to port denied, ret = %d\n",
+					client->handle.guest_id, ret);
+			} else {
+				/* try to attach port */
+				int err = port_attach_client(port, client);
+				if (err) {
+					/* failed to attach port: close channel */
+					LTRACEF("failed (%d) to attach_port\n", err);
+					chan_shutdown_locked(client);
+				}
 			}
 
 			chan_del_ref(client, &tmp_client_ref);   /* drop local ref */
@@ -306,9 +320,9 @@ long __SYSCALL sys_port_create(user_addr_t path, uint num_recv_bufs,
 
 	/* copy path from user space */
 	ret = (int) strncpy_from_user(tmp_path, path, sizeof(tmp_path));
-	if (ret < 0)
+	if (ret < 0) {
 		return (long) ret;
-
+	}
 	if ((uint)ret >= sizeof(tmp_path)) {
 		/* string is too long */
 		return ERR_INVALID_ARGS;
@@ -318,19 +332,19 @@ long __SYSCALL sys_port_create(user_addr_t path, uint num_recv_bufs,
 	ret = ipc_port_create(&tapp->props.uuid, tmp_path,
 		              (uint) num_recv_bufs, recv_buf_size,
 		              flags, &port_handle);
-	if (ret != NO_ERROR)
+	if (ret != NO_ERROR) {
 		goto err_port_create;
-
+	}
 	/* install handle into user context */
 	ret = uctx_handle_install(ctx, port_handle, &handle_id);
-	if (ret != NO_ERROR)
+	if (ret != NO_ERROR) {
 		goto err_install;
-
+	}
 	/* publish for normal operation */
 	ret = ipc_port_publish(port_handle);
-	if (ret != NO_ERROR)
+	if (ret != NO_ERROR) {
 		goto err_publish;
-
+	}
 	return (long) handle_id;
 
 err_publish:
@@ -349,8 +363,9 @@ static ipc_port_t *port_find_locked(const char *path)
 	ipc_port_t *port;
 
 	list_for_every_entry(&ipc_port_list, port, ipc_port_t, node) {
-		if (!strcmp(path, port->path))
+		if (!strcmp(path, port->path)) {
 			return port;
+		}
 	}
 	return NULL;
 }
@@ -364,10 +379,13 @@ static uint32_t port_poll(handle_t *phandle)
 	uint32_t events = 0;
 
 	mutex_acquire(&ipc_lock);
-	if (port->state != IPC_PORT_STATE_LISTENING)
+	if (port->state != IPC_PORT_STATE_LISTENING) {
 		events |= IPC_HANDLE_POLL_ERROR;
-	else if (!list_is_empty(&port->pending_list))
+	} else if (!list_is_empty(&port->pending_list)) {
 		events |= IPC_HANDLE_POLL_READY;
+	} else {
+		/* All if-else chains must end with an else clause */
+	}
 	LTRACEF("%s in state %d events %x\n", port->path, port->state, events);
 	mutex_release(&ipc_lock);
 
@@ -387,9 +405,9 @@ static inline void __chan_destroy_refobj(obj_t *ref)
 	/* should not be in a list  */
 	ASSERT(!list_in_list(&chan->node));
 
-	if (chan->path)
+	if (chan->path) {
 		free((void *)chan->path);
-
+	}
 	if (chan->msg_queue) {
 		ipc_msg_queue_destroy(chan->msg_queue);
 		chan->msg_queue = NULL;
@@ -426,9 +444,9 @@ static ipc_chan_t *chan_alloc(uint32_t flags, const uuid_t *uuid,
 	ipc_chan_t *chan;
 
 	chan = calloc(1, sizeof(ipc_chan_t));
-	if (!chan)
+	if (!chan) {
 		return NULL;
-
+	}
 	/* init ref count */
 	obj_init(&chan->refobj, ref);
 
@@ -561,10 +579,12 @@ static void chan_finalize_event(handle_t *chandle, uint32_t event)
 	if (event & (IPC_HANDLE_POLL_SEND_UNBLOCKED | IPC_HANDLE_POLL_READY)) {
 		mutex_acquire(&ipc_lock);
 		ipc_chan_t *chan = containerof(chandle, ipc_chan_t, handle);
-		if (event & IPC_HANDLE_POLL_SEND_UNBLOCKED)
+		if (event & IPC_HANDLE_POLL_SEND_UNBLOCKED) {
 			chan->aux_state &= ~IPC_CHAN_AUX_STATE_SEND_UNBLOCKED;
-		if (event & IPC_HANDLE_POLL_READY)
+		}
+		if (event & IPC_HANDLE_POLL_READY) {
 			chan->aux_state &= ~IPC_CHAN_AUX_STATE_CONNECTED;
+		}
 		mutex_release(&ipc_lock);
 	}
 }
@@ -575,17 +595,19 @@ static void chan_finalize_event(handle_t *chandle, uint32_t event)
  */
 static int check_access(ipc_port_t *port, const uuid_t *uuid)
 {
-	if (!uuid)
+	if (!uuid) {
 		return ERR_ACCESS_DENIED;
-
+	}
 	if (is_ns_client(uuid)) {
 		/* check if this port allows connection from NS clients */
-		if (port->flags & IPC_PORT_ALLOW_NS_CONNECT)
+		if (port->flags & IPC_PORT_ALLOW_NS_CONNECT) {
 			return NO_ERROR;
+		}
 	} else {
 		/* check if this port allows connection from Trusted Apps */
-		if (port->flags & IPC_PORT_ALLOW_TA_CONNECT)
+		if (port->flags & IPC_PORT_ALLOW_TA_CONNECT) {
 			return NO_ERROR;
+		}
 	}
 
 	return ERR_ACCESS_DENIED;
@@ -671,7 +693,7 @@ err_client_mq:
  * Client requests a connection to a port. It can be called in context
  * of user task as well as vdev RX thread.
  */
-int ipc_port_connect_async(const uuid_t *cid, const char *path, size_t max_path,
+int ipc_port_connect_async(uint32_t guest, const uuid_t *cid, const char *path, size_t max_path,
 			   uint flags, handle_t **chandle_ptr)
 {
 	ipc_port_t *port;
@@ -707,9 +729,16 @@ int ipc_port_connect_async(const uuid_t *cid, const char *path, size_t max_path,
 	port = port_find_locked(path);
 	if (port) {
 		/* found  */
-		ret = port_attach_client(port, client);
-		if (ret)
+		ret = trusty_hyp_check_guest_access(guest, port->uuid);
+		if (ret) {
 			goto err_attach_client;
+		}
+		port->handle.guest_id = guest;
+
+		ret = port_attach_client(port, client);
+		if (ret) {
+			goto err_attach_client;
+		}
 	} else {
 		if (!(flags & IPC_CONNECT_WAIT_FOR_PORT)) {
 			ret = ERR_NOT_FOUND;
@@ -729,11 +758,15 @@ int ipc_port_connect_async(const uuid_t *cid, const char *path, size_t max_path,
 		chan_add_ref(client, &client->node_ref);
 	}
 
-	LTRACEF("new connection: client %p: peer %p\n",
-		client, client->peer);
-
 	/* success */
 	*chandle_ptr = chan_handle_init(client);
+
+	/* Save guest id into client channel */
+	client->handle.guest_id = guest;
+
+	LTRACEF("new connection: guest_id = %x client %p: server %p\n",
+		guest, client, client->peer);
+
 	ret = NO_ERROR;
 
 err_alloc_path:
@@ -759,6 +792,7 @@ long __SYSCALL sys_connect(user_addr_t path, uint flags)
 	char tmp_path[IPC_PORT_PATH_MAX];
 	int ret;
 	handle_id_t handle_id;
+	uint32_t cur_guest;
 
 	if (flags & ~IPC_CONNECT_MASK) {
 		/* unsupported flags specified */
@@ -766,18 +800,20 @@ long __SYSCALL sys_connect(user_addr_t path, uint flags)
 	}
 
 	ret = (int) strncpy_from_user(tmp_path, path, sizeof(tmp_path));
-	if (ret < 0)
+	if (ret < 0) {
 		return (long) ret;
-
-	if ((uint)ret >= sizeof(tmp_path))
+	}
+	if ((uint)ret >= sizeof(tmp_path)) {
 		return (long) ERR_INVALID_ARGS;
+	}
+	cur_guest = uctx_get_current_guest();
 
-	ret = ipc_port_connect_async(&tapp->props.uuid,
+	ret = ipc_port_connect_async(cur_guest, &tapp->props.uuid,
 				     tmp_path, sizeof(tmp_path),
 				     flags, &chandle);
-	if (ret != NO_ERROR)
+	if (ret != NO_ERROR) {
 		return (long) ret;
-
+	}
 	if (!(flags & IPC_CONNECT_ASYNC)) {
 		uint32_t event;
 		lk_time_t timeout_msecs = DEFAULT_IPC_CONNECT_WARN_TIMEOUT;
@@ -894,6 +930,11 @@ int ipc_port_accept(handle_t *phandle, handle_t **chandle_ptr,
 	*chandle_ptr = chan_handle_init(server);
 	*uuid_ptr = client->uuid;
 
+	/* Save guest id into server channel */
+	server->handle.guest_id = client->handle.guest_id;
+	LTRACEF("guest_id = %x client %p: server %p\n",
+		server->handle.guest_id, client, client->peer);
+
 	/* notify client */
 	handle_notify(&client->handle);
 
@@ -917,22 +958,22 @@ long __SYSCALL sys_accept(uint32_t handle_id, user_addr_t user_uuid)
 	const uuid_t *peer_uuid_ptr;
 
 	ret = uctx_handle_get(ctx, handle_id, &phandle);
-	if (ret != NO_ERROR)
+	if (ret != NO_ERROR) {
 		return (long) ret;
-
+	}
 	ret = ipc_port_accept(phandle, &chandle, &peer_uuid_ptr);
-	if (ret != NO_ERROR)
+	if (ret != NO_ERROR) {
 		goto err_accept;
-
+	}
 	ret = uctx_handle_install(ctx, chandle, &new_id);
-	if (ret != NO_ERROR)
+	if (ret != NO_ERROR) {
 		goto err_install;
-
+	}
 	/* copy peer uuid into userspace */
 	ret = copy_to_user(user_uuid, peer_uuid_ptr, sizeof(uuid_t));
-	if (ret != NO_ERROR)
+	if (ret != NO_ERROR) {
 		goto err_uuid_copy;
-
+	}
 	handle_decref(phandle);
 	return (long) new_id;
 

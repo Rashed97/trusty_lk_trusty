@@ -116,10 +116,11 @@ enum
 	UTM_NS_MEM	= 1 << 6,
 	UTM_IO		= 1 << 7,
 	UTM_FIXED	= 1 << 8,
+	UTM_DEVICE	= 1 << 9,
 };
 
 /* uthread mapping alignments */
-#define UT_MAP_ALIGN_4KB	(4UL * 1024)
+#define UT_MAP_ALIGN_4KB	(4UL * 1024UL)
 #define UT_MAP_ALIGN_1MB	(1UL * 1024 * 1024)
 #define UT_MAP_ALIGN_DEFAULT	UT_MAP_ALIGN_4KB
 
@@ -135,6 +136,11 @@ void uthread_exit(int retcode) __NO_RETURN;
 
 /* Map a region of memory in the uthread */
 status_t uthread_map(uthread_t *ut, vaddr_t *vaddrp, paddr_t *pfn_list,
+		size_t size, u_int flags, u_int align);
+
+/* Allocate a region of memory from the TOS kernel
+ * and then map it in the uthread */
+status_t uthread_pmm_alloc_and_map(uthread_t *ut, vaddr_t *vaddrp,
 		size_t size, u_int flags, u_int align);
 
 /* Unmap a region of memory */

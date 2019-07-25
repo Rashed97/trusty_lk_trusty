@@ -35,6 +35,8 @@
 #include <debug.h>
 #include <err.h>
 #include <kernel/thread.h>
+#include <uthread.h>
+#include <trusty_std.h>
 
 long sys_undefined(int num)
 {
@@ -45,7 +47,7 @@ long sys_undefined(int num)
 #ifdef WITH_SYSCALL_TABLE
 
 /* Generate fake function prototypes */
-#define DEF_SYSCALL(nr, fn, rtype, nr_args, ...) rtype sys_##fn (void);
+#define DEF_SYSCALL(nr, fn, rtype, nr_args, ...) rtype sys_##fn (__VA_ARGS__);
 #include <syscall_table.h>
 #undef DEF_SYSCALL
 

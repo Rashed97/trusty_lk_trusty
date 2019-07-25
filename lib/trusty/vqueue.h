@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2013-2014, Google, Inc. All rights reserved
+ * Copyright (c) 2017, NVIDIA CORPORATION. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -75,13 +76,14 @@ struct vqueue_buf {
 
 int vqueue_init(struct vqueue *vq, uint32_t id,
 		paddr_t addr, uint num, ulong align,
-		void *priv, vqueue_cb_t notify_cb, vqueue_cb_t kick_cb);
+		void *priv, vqueue_cb_t notify_cb, vqueue_cb_t kick_cb,
+		uint32_t guest);
 
 void vqueue_destroy(struct vqueue *vq);
 
 int vqueue_get_avail_buf(struct vqueue *vq, struct vqueue_buf *iovbuf);
 
-int vqueue_map_iovs(struct vqueue_iovs *vqiovs, u_int flags);
+int vqueue_map_iovs(struct vqueue_iovs *vqiovs, u_int flags, uint32_t guest);
 void vqueue_unmap_iovs(struct vqueue_iovs *vqiovs);
 
 int vqueue_add_buf(struct vqueue *vq, struct vqueue_buf *buf, uint32_t len);
@@ -95,15 +97,17 @@ static inline uint32_t vqueue_id(struct vqueue *vq)
 
 static inline int vqueue_notify(struct vqueue *vq)
 {
-	if (vq->notify_cb)
+	if (vq->notify_cb){
 		return vq->notify_cb(vq, vq->priv);
+	}
 	return 0;
 }
 
 static inline int vqueue_kick(struct vqueue *vq)
 {
-	if (vq->kick_cb)
+	if (vq->kick_cb){
 		return vq->kick_cb(vq, vq->priv);
+	}
 	return 0;
 }
 

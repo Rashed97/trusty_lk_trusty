@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2013-2014, Google Inc. All rights reserved
- * Copyright (c) 2012-2013, NVIDIA CORPORATION. All rights reserved
+ * Copyright (c) 2012-2019, NVIDIA CORPORATION. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -48,6 +48,7 @@ void arch_uthread_startup(void)
 	register uint64_t sp_usr asm("x2") = ROUNDDOWN(ut->start_stack, 8);
 	register uint64_t entry asm("x3") = ut->entry;
 
+	arch_disable_ints();
 	__asm__ volatile(
 		"mov	x0, #0\n"
 		"mov	x1, #0\n"
@@ -106,9 +107,9 @@ status_t arm64_uthread_allocate_page_table(struct uthread *ut)
 	page_table_size = MMU_USER_PAGE_TABLE_ENTRIES_TOP * sizeof(pte_t);
 
 	ut->page_table = memalign(page_table_size, page_table_size);
-	if (!ut->page_table)
+	if (!ut->page_table) {
 		return ERR_NO_MEMORY;
-
+	}
 	memset(ut->page_table, 0, page_table_size);
 
 	LTRACEF("id %d, user page table %p, size %ld\n",
@@ -125,8 +126,9 @@ status_t arch_uthread_map(struct uthread *ut, struct uthread_map *mp)
 
 	if (!ut->page_table) {
 		err = arm64_uthread_allocate_page_table(ut);
-		if (err)
+		if (err) {
 			return err;
+		}
 	}
 
 	ASSERT(!(mp->size & USER_PAGE_MASK));
@@ -137,8 +139,24 @@ status_t arch_uthread_map(struct uthread *ut, struct uthread_map *mp)
 
 	pte_attr |= (mp->flags & UTM_W) ? MMU_PTE_ATTR_AP_P_RW_U_RW :
 	                                  MMU_PTE_ATTR_AP_P_RO_U_RO;
+	/*
+	 * IO and Device memory should remain XN
+	 *
+	 * To ensure that memory that is tagged either
+	 * as IO (UTM_IO) or as Device Memory (UTM_DEVICE)
+	 * is not speculatively prefeched as an instruction,
+	 * these mappings should always be tagged as execute-never.
+	 *
+	 * The code block below always asserts this
+	 */
 	if (mp->flags & UTM_IO) {
 		pte_attr |= MMU_PTE_ATTR_STRONGLY_ORDERED;
+		/* Explictly check that IO mem is not tagged as executable */
+		ASSERT(!(mp->flags & UTM_X));
+	} else if (mp->flags & UTM_DEVICE) {
+		pte_attr |= MMU_PTE_ATTR_DEVICE;
+		/* Explictly check that Device mem is not tagged as executable */
+		ASSERT(!(mp->flags & UTM_X));
 	} else {
 		/* shareable */
 		pte_attr |= MMU_PTE_ATTR_SH_INNER_SHAREABLE;
@@ -147,6 +165,13 @@ status_t arch_uthread_map(struct uthread *ut, struct uthread_map *mp)
 		pte_attr |= MMU_PTE_ATTR_NORMAL_MEMORY;
 	}
 
+	/*
+	 * Mark execute-never unless explicitly flagged as UTM_X.
+	 * Mark NS memory as execute-never always.
+	 */
+	if ( !(mp->flags & UTM_X) || (mp->flags & UTM_NS_MEM) )
+	    pte_attr |= (MMU_PTE_ATTR_UXN | MMU_PTE_ATTR_PXN);
+
 	entry_size = (mp->flags & UTM_PHYS_CONTIG) ? mp->size : USER_PAGE_SIZE;
 	for (pg = 0; pg < (mp->size / entry_size); pg++) {
 		err = arm64_mmu_map(mp->vaddr + pg * entry_size,
@@ -154,8 +179,9 @@ status_t arch_uthread_map(struct uthread *ut, struct uthread_map *mp)
 		                    0, MMU_USER_SIZE_SHIFT, MMU_USER_TOP_SHIFT,
 		                    MMU_USER_PAGE_SIZE_SHIFT,
 		                    ut->page_table, ut->arch.asid);
-		if (err)
+		if (err) {
 			goto err_undo_maps;
+		}
 	}
 
 	return NO_ERROR;
@@ -234,13 +260,14 @@ status_t arch_uthread_translate_map(struct uthread *ut_target,
 	u_int first_inner = ~0, first_outer = ~0, first_shareable = ~0;
 
 	pte_attr = MMU_PTE_ATTR_NON_GLOBAL | MMU_PTE_ATTR_AF;
-	if (flags & UTM_NS_MEM)
+	if (flags & UTM_NS_MEM) {
 		pte_attr |= MMU_PTE_ATTR_NON_SECURE;
-	if (flags & UTM_W)
+	}
+	if (flags & UTM_W) {
 		pte_attr |= MMU_PTE_ATTR_AP_P_RW_U_RW;
-	else
+	} else {
 		pte_attr |= MMU_PTE_ATTR_AP_P_RO_U_RO;
-
+	}
 	vs = vaddr_src;
 	vt = vaddr_target;
 	for (pg = 0; pg < npages; pg++, vs += USER_PAGE_SIZE, vt += USER_PAGE_SIZE) {
@@ -286,10 +313,11 @@ status_t arch_uthread_translate_map(struct uthread *ut_target,
 			shareable = NS_PTE_ATTR_SHAREABLE(pte);
 		} else {
 			arch_disable_ints();
-			if (flags & UTM_W)
+			if (flags & UTM_W) {
 				ARM64_WRITE_AT(S1E0W, vs);
-			else
+			} else {
 				ARM64_WRITE_AT(S1E0R, vs);
+			}
 			par = ARM64_READ_SYSREG(par_el1);
 			arch_enable_ints();
 
@@ -312,14 +340,14 @@ status_t arch_uthread_translate_map(struct uthread *ut_target,
 		 * consistency on subsequent pages
 		 */
 		if (pg == 0) {
-			if (shareable)
+			if (shareable) {
 				pte_attr |= MMU_PTE_ATTR_SH_INNER_SHAREABLE;
-
+			}
 			/* inner cacheable (cb) */
 			/* outer cacheable (tex) */
-			if (inner | outer)
+			if (inner | outer) {
 				pte_attr |= MMU_PTE_ATTR_NORMAL_MEMORY;
-
+			}
 			first_inner = inner;
 			first_outer = outer;
 			first_shareable = shareable;
@@ -341,8 +369,9 @@ status_t arch_uthread_translate_map(struct uthread *ut_target,
 		                    0, MMU_USER_SIZE_SHIFT, MMU_USER_TOP_SHIFT,
 		                    MMU_USER_PAGE_SIZE_SHIFT,
 		                    ut_target->page_table, ut_target->arch.asid);
-		if (err != NO_ERROR)
+		if (err != NO_ERROR) {
 			goto err_out;
+		}
 	}
 
 err_out:

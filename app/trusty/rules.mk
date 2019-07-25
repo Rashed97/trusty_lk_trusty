@@ -23,6 +23,10 @@
 
 LOCAL_DIR := $(GET_LOCAL_DIR)
 
+ifneq ($(filter embedded-v2%, $(TRUSTY_VARIANT)),)
+MODULE_CFLAGS += -DTRUSTY_EMBEDDED_BUILD
+endif
+
 # common user task related globals
 XBIN_LDFLAGS := --gc-sections
 

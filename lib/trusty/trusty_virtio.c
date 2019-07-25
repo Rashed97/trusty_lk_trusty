@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2015, Google, Inc. All rights reserved
+ * Copyright (c) 2017, NVIDIA Corporation. All rights reserved
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -34,7 +35,10 @@
 #include <kernel/mutex.h>
 #include <arch/arch_ops.h>
 
+#include <platform/speculation_barrier.h>
 #include <remoteproc/remoteproc.h>
+#include <lib/trusty/trusty_guest_ctx.h>
+#include <lib/trusty/hyp.h>
 #include "trusty_virtio.h"
 
 #define LOCAL_TRACE  0
@@ -63,17 +67,29 @@ struct trusty_virtio_bus {
 };
 
 
-static struct trusty_virtio_bus _virtio_bus = {
+typedef struct {
+	uint32_t num_guests;
+	struct trusty_virtio_bus guest0_virtio_bus;
+	struct trusty_virtio_bus *addl_guests_virtio_bus;
+} guests_vbus_context_t;
+
+static guests_vbus_context_t guests_vbus_context = {
+	.num_guests = 0,
+	.guest0_virtio_bus = {
 	.vdev_cnt = 0,
 	.descr_size = 0,
 	.next_dev_id = 0,
 	.state = VIRTIO_BUS_STATE_UNINITIALIZED,
-	.vdev_list = LIST_INITIAL_VALUE(_virtio_bus.vdev_list),
+	.vdev_list = LIST_INITIAL_VALUE(guests_vbus_context.guest0_virtio_bus.vdev_list), },
+	.addl_guests_virtio_bus = NULL,
 };
 
 static status_t map_descr(ns_paddr_t buf_pa, void **buf_va, ns_size_t sz,
-                          uint buf_mmu_flags)
+                          uint buf_mmu_flags, uint32_t guest_id)
 {
+	status_t ret;
+	size_t roundedup_sz;
+
 	if (!buf_pa) {
 		LTRACEF("invalid descr addr 0x%llx\n", buf_pa);
 		return ERR_INVALID_ARGS;
@@ -91,9 +107,17 @@ static status_t map_descr(ns_paddr_t buf_pa, void **buf_va, ns_size_t sz,
 	}
 #endif
 
+	roundedup_sz = ROUNDUP(sz, PAGE_SIZE);
+	ret = trusty_hyp_check_guest_pa_valid(buf_pa, roundedup_sz, guest_id);
+	if (ret != NO_ERROR) {
+		TRACEF("%s: check_guest_pa_valid failed, error = %d",
+			__func__, ret);
+		return ret;
+	}
+
 	/* map resource table into our address space */
 	return  vmm_alloc_physical(vmm_get_kernel_aspace(), "virtio",
-	                           ROUNDUP(sz, PAGE_SIZE),
+	                           roundedup_sz,
 	                           buf_va, PAGE_SIZE_SHIFT,
 	                           (paddr_t) buf_pa, 0, buf_mmu_flags);
 }
@@ -128,13 +152,51 @@ static status_t validate_vdev(struct vdev *vd)
 	return NO_ERROR;
 }
 
+static status_t get_guest_virtio_bus(struct trusty_virtio_bus **vb,
+		uint32_t guest_id)
+{
+	if (vb == NULL) {
+		TRACEF("%s: Bad pointer. vb is NULL\n", __func__);
+		return ERR_INVALID_ARGS;
+	}
+
+	if (guest_id > 0) {
+		if (guest_id >= guests_vbus_context.num_guests) {
+			TRACEF("%s: Bad input, guest %d regd_guests %d\n",
+				__func__, guest_id, guests_vbus_context.num_guests);
+			return ERR_INVALID_ARGS;
+		}
+
+		/* Barrier against speculating addl_guests_virtio_bus[guest_id - 1] */
+		platform_arch_speculation_barrier();
+
+		if (guests_vbus_context.addl_guests_virtio_bus == NULL) {
+			TRACEF("%s: addl_guests_virtio_bus init failed\n",
+				 __func__);
+			return ERR_NOT_READY;
+		}
+
+		*vb = guests_vbus_context.addl_guests_virtio_bus + (guest_id - 1);
+	} else {
+		*vb = &guests_vbus_context.guest0_virtio_bus;
+	}
+
+	return NO_ERROR;
+}
+
 /*
  *     Register virtio device
  */
-status_t virtio_register_device(struct vdev *vd)
+status_t virtio_register_device(struct vdev *vd, uint32_t guest_id)
 {
 	status_t ret = ERR_BAD_STATE;
-	struct trusty_virtio_bus *vb = &_virtio_bus;
+	struct trusty_virtio_bus *vb = NULL;
+
+	guests_vbus_context.num_guests++;
+
+	if (get_guest_virtio_bus(&vb, guest_id)) {
+		return ERR_INVALID_ARGS;
+	}
 
 	if (vb->state == VIRTIO_BUS_STATE_UNINITIALIZED) {
 		ret = validate_vdev(vd);
@@ -150,9 +212,13 @@ status_t virtio_register_device(struct vdev *vd)
 /*
  *
  */
-static void finalize_vdev_registery(void)
+static ssize_t finalize_vdev_registery(uint32_t guest_id)
 {
-	struct trusty_virtio_bus *vb = &_virtio_bus;
+	struct trusty_virtio_bus *vb = NULL;
+
+	if (get_guest_virtio_bus(&vb, guest_id)) {
+		return ERR_INVALID_ARGS;
+	}
 
 	if (vb->state == VIRTIO_BUS_STATE_UNINITIALIZED) {
 		struct vdev *vd;
@@ -171,21 +237,31 @@ static void finalize_vdev_registery(void)
 		vb->descr_size = offset;
 		vb->state = VIRTIO_BUS_STATE_IDLE;
 	}
+
+	return NO_ERROR;
 }
 
 /*
  * Retrieve device description to be shared with NS side
  */
 ssize_t virtio_get_description(ns_paddr_t buf_pa, ns_size_t buf_sz,
-                               uint buf_mmu_flags)
+                               uint buf_mmu_flags, uint32_t guest_id)
 {
 	status_t ret;
 	struct vdev *vd;
-	struct trusty_virtio_bus *vb = &_virtio_bus;
+	struct trusty_virtio_bus *vb = NULL;
 
 	LTRACEF("descr_buf: %u bytes @ 0x%llx\n", buf_sz, buf_pa);
 
-	finalize_vdev_registery();
+	if (get_guest_virtio_bus(&vb, guest_id)) {
+		return ERR_INVALID_ARGS;
+	}
+
+	ret = finalize_vdev_registery(guest_id);
+	if (ret != NO_ERROR) {
+		TRACEF("failed (%d) finalize_vdev_registery\n", ret);
+		return ret;
+	}
 
 	if ((size_t)buf_sz < vb->descr_size) {
 		LTRACEF("buffer (%zu bytes) is too small (%zu needed)\n",
@@ -195,7 +271,7 @@ ssize_t virtio_get_description(ns_paddr_t buf_pa, ns_size_t buf_sz,
 
 	/* map in NS memory */
 	void *va = NULL;
-	ret = map_descr(buf_pa, &va, vb->descr_size, buf_mmu_flags);
+	ret = map_descr(buf_pa, &va, vb->descr_size, buf_mmu_flags, guest_id);
 	if (ret != NO_ERROR) {
 		LTRACEF("failed (%d) to map in descriptor buffer\n",
 			(int)ret);
@@ -228,15 +304,19 @@ ssize_t virtio_get_description(ns_paddr_t buf_pa, ns_size_t buf_sz,
  * Called by NS side to finalize device initialization
  */
 status_t virtio_start(ns_paddr_t ns_descr_pa, ns_size_t descr_sz,
-                      uint descr_mmu_flags)
+                      uint descr_mmu_flags, uint32_t guest_id)
 {
 	status_t ret;
 	int oldstate;
 	void *descr_va;
 	void *ns_descr_va = NULL;
-	struct trusty_virtio_bus *vb = &_virtio_bus;
+	struct trusty_virtio_bus *vb = NULL;
 
 	LTRACEF("%u bytes @ 0x%llx\n", descr_sz, ns_descr_pa);
+
+	if (get_guest_virtio_bus(&vb, guest_id)) {
+		return ERR_INVALID_ARGS;
+	}
 
 	oldstate = atomic_cmpxchg(&vb->state,
 				  VIRTIO_BUS_STATE_IDLE,
@@ -262,7 +342,7 @@ status_t virtio_start(ns_paddr_t ns_descr_pa, ns_size_t descr_sz,
 		goto err_alloc_descr;
 	}
 
-	ret = map_descr(ns_descr_pa, &ns_descr_va, vb->descr_size, descr_mmu_flags);
+	ret = map_descr(ns_descr_pa, &ns_descr_va, vb->descr_size, descr_mmu_flags, guest_id);
 	if (ret != NO_ERROR) {
 		LTRACEF("failed (%d) to map in descriptor buffer\n", ret);
 		goto err_map_in;
@@ -292,21 +372,26 @@ err_bad_params:
 	return ret;
 }
 
-status_t virtio_stop(ns_paddr_t descr_pa, ns_size_t descr_sz, uint descr_mmu_flags)
+status_t virtio_stop(ns_paddr_t descr_pa, ns_size_t descr_sz,
+		     uint descr_mmu_flags, uint32_t guest_id)
 {
 	int oldstate;
 	struct vdev *vd;
-	struct trusty_virtio_bus *vb = &_virtio_bus;
+	struct trusty_virtio_bus *vb = NULL;
 
 	LTRACEF("%u bytes @ 0x%llx\n", descr_sz, descr_pa);
+
+	if (get_guest_virtio_bus(&vb, guest_id)) {
+		return ERR_INVALID_ARGS;
+	}
 
 	oldstate = atomic_cmpxchg(&vb->state,
 				  VIRTIO_BUS_STATE_ACTIVE,
 				  VIRTIO_BUS_STATE_DEACTIVATING);
 
-	if (oldstate != VIRTIO_BUS_STATE_ACTIVE)
+	if (oldstate != VIRTIO_BUS_STATE_ACTIVE) {
 		return ERR_BAD_STATE;
-
+	}
 	/* reset all devices */
 	list_for_every_entry(&vb->vdev_list, vd, struct vdev, node) {
 		vd->ops->reset(vd);
@@ -320,16 +405,21 @@ status_t virtio_stop(ns_paddr_t descr_pa, ns_size_t descr_sz, uint descr_mmu_fla
 /*
  *  Reset virtio device with specified device id
  */
-status_t virtio_device_reset(uint devid)
+status_t virtio_device_reset(uint devid, uint32_t guest_id)
 {
 	struct vdev *vd;
 	status_t ret = ERR_NOT_FOUND;
-	struct trusty_virtio_bus *vb = &_virtio_bus;
+	struct trusty_virtio_bus *vb = NULL;
 
 	LTRACEF("dev=%d\n", devid);
 
-	if (vb->state != VIRTIO_BUS_STATE_ACTIVE)
+	if (get_guest_virtio_bus(&vb, guest_id)) {
+		return ERR_INVALID_ARGS;
+	}
+
+	if (vb->state != VIRTIO_BUS_STATE_ACTIVE) {
 		return ERR_BAD_STATE;
+	}
 
 	list_for_every_entry(&vb->vdev_list, vd, struct vdev, node) {
 		if (vd->devid == devid) {
@@ -343,19 +433,23 @@ status_t virtio_device_reset(uint devid)
 /*
  *  Kick vq for virtio device with specified device id
  */
-status_t virtio_kick_vq(uint devid, uint vqid)
+status_t virtio_kick_vq(uint devid, uint vqid, uint32_t guest_id)
 {
 	struct vdev *vd;
 	status_t ret = ERR_NOT_FOUND;
-	struct trusty_virtio_bus *vb = &_virtio_bus;
+	struct trusty_virtio_bus *vb = NULL;
 
 #if WITH_CHATTY_LTRACE
 	LTRACEF("dev=%d\n", devid);
 #endif
 
-	if (vb->state != VIRTIO_BUS_STATE_ACTIVE)
-		return ERR_BAD_STATE;
+	if (get_guest_virtio_bus(&vb, guest_id)) {
+		return ERR_INVALID_ARGS;
+	}
 
+	if (vb->state != VIRTIO_BUS_STATE_ACTIVE) {
+		return ERR_BAD_STATE;
+	}
 	list_for_every_entry(&vb->vdev_list, vd, struct vdev, node) {
 		if (vd->devid == devid) {
 			ret = vd->ops->kick_vqueue(vd, vqid);
@@ -365,3 +459,44 @@ status_t virtio_kick_vq(uint devid, uint vqid)
 	return ret;
 }
 
+status_t alloc_guest_virtio_bus(uint32_t num_guests)
+{
+	uint32_t count;
+	struct trusty_virtio_bus *vb = NULL;
+
+	if (num_guests > MAX_NUM_SUPPORTED_GUESTS) {
+		TRACEF("%s error. No of guest OS (%d) out of range."
+			"Max supported %d\n",
+			__func__, num_guests, MAX_NUM_SUPPORTED_GUESTS);
+		return ERR_INVALID_ARGS;
+	}
+
+	/* Barrier against speculating addl_guests_virtio_bus[count] based on num_guests */
+	platform_arch_speculation_barrier();
+
+	guests_vbus_context.addl_guests_virtio_bus =
+		calloc(num_guests, sizeof(struct trusty_virtio_bus));
+	if (guests_vbus_context.addl_guests_virtio_bus == NULL_PTR) {
+		TRACEF("%s: out of memory."
+			" Cannot allocate additional guests virtio_bus\n",
+			__func__);
+		return ERR_NO_MEMORY;
+	}
+
+	for(count = 0; count < num_guests; count++) {
+		vb = guests_vbus_context.addl_guests_virtio_bus + count;
+		vb->vdev_cnt = 0;
+		vb->descr_size = 0;
+		vb->next_dev_id = 0;
+		vb->state = VIRTIO_BUS_STATE_UNINITIALIZED;
+		list_initialize(&vb->vdev_list);
+	}
+
+	return NO_ERROR;
+}
+
+void free_guest_virtio_bus(void)
+{
+	free(guests_vbus_context.addl_guests_virtio_bus);
+	guests_vbus_context.addl_guests_virtio_bus = NULL;
+}

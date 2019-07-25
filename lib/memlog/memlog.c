@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2015 Google, Inc.
+ * Copyright (c) 2015-2017, NVIDIA CORPORATION. All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining
  * a copy of this software and associated documentation files
@@ -35,6 +36,7 @@
 #include <err.h>
 #include <pow2.h>
 #include <list.h>
+#include <lib/trusty/hyp.h>
 
 #include "trusty-log.h"
 
@@ -70,10 +72,12 @@ static bool memlog_is_mem_registered(paddr_t pa, size_t sz)
 {
 	struct memlog *log;
 	list_for_every_entry(&log_list, log, struct memlog, entry) {
-		if (pa + sz <= log->buf_pa)
+		if (pa + sz <= log->buf_pa) {
 			continue;
-		if (pa >= log->buf_pa + log->buf_sz)
+		}
+		if (pa >= log->buf_pa + log->buf_sz){
 			continue;
+		}
 		return true;
 	}
 	return false;
@@ -118,22 +122,30 @@ static void memlog_write(struct memlog *log, const char *str, size_t len)
 		__memlog_write(log, &str[i * chunk_size], chunk_size);
 	}
 	rem = len - i * chunk_size;
-	if (rem)
+	if (rem) {
 		__memlog_write(log, &str[i * chunk_size], rem);
+	}
 	spin_unlock_restore(&log_lock, state, LOG_LOCK_FLAGS);
 }
 
-static status_t map_rb(paddr_t pa, size_t sz, vaddr_t *va)
+static status_t map_rb(paddr_t pa, size_t sz, uint32_t guest, vaddr_t *va)
 {
 	size_t mb = 1 << 20;
 	size_t offset;
-	status_t err;
+	status_t err = 0;
 	unsigned flags = ARCH_MMU_FLAG_CACHED |
 	                 ARCH_MMU_FLAG_NS | ARCH_MMU_FLAG_PERM_NO_EXECUTE;
 
 	offset = pa & (mb - 1);
 	pa = ROUNDDOWN(pa, mb);
 	sz = ROUNDUP((sz + offset), mb);
+
+	err = trusty_hyp_check_guest_pa_valid(pa, sz, guest);
+	if (err != NO_ERROR) {
+		dprintf(ALWAYS, "%s: check_guest_pa_valid failed, error = %d",
+			__func__, err);
+		return err;
+	}
 
 	err = vmm_alloc_physical(vmm_get_kernel_aspace(),
 				 "logmem", sz, (void**)va, PAGE_SIZE_SHIFT, pa, 0, flags);
@@ -154,13 +166,18 @@ static size_t args_get_sz(smc32_args_t *args)
 	return (size_t) args->params[2];
 }
 
+static uint32_t args_get_guest(smc32_args_t *args)
+{
+	return (uint32_t) args->params[SMC_ARGS_GUESTID];
+}
+
 void memlog_print_callback(print_callback_t *cb, const char *str, size_t len)
 {
 	struct memlog *log = containerof(cb, struct memlog, cb);
 	memlog_write(log, str, len);
 }
 
-long memlog_add(paddr_t pa, size_t sz)
+long memlog_add(paddr_t pa, size_t sz, uint32_t guest)
 {
 	struct memlog *log;
 	vaddr_t va;
@@ -168,9 +185,9 @@ long memlog_add(paddr_t pa, size_t sz)
 	status_t result;
 	struct log_rb *rb;
 
-	if (memlog_is_mem_registered(pa, sz))
+	if (memlog_is_mem_registered(pa, sz)) {
 		return SM_ERR_INVALID_PARAMETERS;
-
+	}
 	log = malloc(sizeof(*log));
 	if (!log) {
 		return SM_ERR_INTERNAL_FAILURE;
@@ -178,7 +195,7 @@ long memlog_add(paddr_t pa, size_t sz)
 	log->buf_pa = pa;
 	log->buf_sz = sz;
 
-	result = map_rb(pa, sz, &va);
+	result = map_rb(pa, sz, guest, &va);
 	if (result != NO_ERROR) {
 		status = SM_ERR_INTERNAL_FAILURE;
 		goto error_failed_to_map;
@@ -221,13 +238,27 @@ long memlog_rm(paddr_t pa)
 	return 0;
 }
 
+status_t memlog_rst(void)
+{
+	struct memlog *curr_log;
+	status_t result = NO_ERROR;
+
+	while (!list_is_empty(&log_list) &&
+		   result == NO_ERROR) {
+		curr_log = list_next_type(&log_list, &log_list,
+					struct memlog, entry);
+		result = memlog_rm(curr_log->buf_pa);
+	}
+	return result;
+}
+
 static long memlog_stdcall(smc32_args_t *args)
 {
 	switch (args->smc_nr) {
 	case SMC_SC_SHARED_LOG_VERSION:
 		return TRUSTY_LOG_API_VERSION;
 	case SMC_SC_SHARED_LOG_ADD:
-		return memlog_add(args_get_pa(args), args_get_sz(args));
+		return memlog_add(args_get_pa(args), args_get_sz(args), args_get_guest(args));
 	case SMC_SC_SHARED_LOG_RM:
 		return memlog_rm(args_get_pa(args));
 	default:

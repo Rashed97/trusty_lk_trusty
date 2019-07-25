@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2013-2015, Google, Inc. All rights reserved
+# Copyright (c) 2013-2017, Google, Inc. All rights reserved
 #
 # Permission is hereby granted, free of charge, to any person obtaining
 # a copy of this software and associated documentation files
@@ -22,8 +22,6 @@
 #
 
 LOCAL_DIR := $(GET_LOCAL_DIR)
-
-EXTRA_LINKER_SCRIPTS += $(LOCAL_DIR)/trusty_apps.ld
 
 MODULE := $(LOCAL_DIR)
 
@@ -61,6 +59,7 @@ MODULE_DEPS += \
 	lib/uthread \
 	lib/syscall \
 	lib/version \
+	lib/boot_profiler
 
 ifeq ($(call TOBOOL,$(CLANGBUILD)), true)
 MODULE_DEPS += lib/rt
@@ -68,5 +67,6 @@ endif
 
 GLOBAL_DEFINES += \
 	WITH_SYSCALL_TABLE=1 \
+	UTHREAD_WITH_MEMORY_MAPPING_SUPPORT=1 \
 
 include make/module.mk
